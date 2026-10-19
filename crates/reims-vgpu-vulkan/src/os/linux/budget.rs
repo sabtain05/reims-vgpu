@@ -129,6 +129,21 @@ fn count_on(counter: &AtomicU64, count: u64, holding: bool) {
     }
 }
 
+/// The import twins' mappings now.
+pub(super) fn twin_mappings() -> u64 {
+    TWIN_MAPPINGS.load(Ordering::Relaxed)
+}
+
+/// The stand-ins' mappings of their own memory now.
+pub(super) fn own_mappings() -> u64 {
+    OWN_MAPPINGS.load(Ordering::Relaxed)
+}
+
+/// The budget under the limit as last read.
+pub(super) fn budget_now() -> u64 {
+    budget(limit())
+}
+
 /// The mappings the library's views hold now (module docs).
 pub(super) fn held() -> u64 {
     files::mappings()

@@ -120,11 +120,12 @@ impl<P: Platform> GpuTask<P> {
         Ok(cursors)
     }
 
-    /// Runs the command buffers `data` names on the GPU, as a job; replies
-    /// `(status, shared-texture backing ids, their count)`.
+    /// Runs the command buffers `data` names on the GPU, as a job: on the calling thread when
+    /// `here` ([`GpuTask::job_on`]); replies `(status, shared-texture backing ids, their count)`.
     #[expect(clippy::too_many_arguments, reason = "the exec message's fields")]
     pub(super) fn exec(
         &self,
+        here: bool,
         data: Vec<u8>,
         cmd_buffer_count: u32,
         resource_count: u32,
@@ -133,7 +134,7 @@ impl<P: Platform> GpuTask<P> {
         gpu_completion: u64,
         reply: Reply<(u32, Option<Vec<u8>>, u32)>,
     ) {
-        self.job(move |this, hold| {
+        self.job_on(here, move |this, hold| {
             this.exec_job(
                 hold,
                 &data,
@@ -660,6 +661,7 @@ mod tests {
     use super::*;
     use crate::platform::device::GpuDevice;
     use crate::platform::types::NsErrorText;
+    use crate::tasks::isolation::TaskLife;
     use crate::tasks::launcher::ServiceSide;
     use crate::tasks::wire::ToService;
     use crate::testkit::guest_ram::RawRegion;
@@ -760,6 +762,72 @@ mod tests {
         assert!(!sels.contains(&"encodeWaitForEvent:value:"));
         assert_eq!(tx.task.fifos.lock()[&1].signaled.load(Ordering::SeqCst), 1);
         assert_eq!(*tx.host.sent.lock(), vec!["complete 119 1".to_owned()]);
+    }
+
+    /// An exec taken here (`on_message_here`, inside the delivery's run of the task's code, as
+    /// the connection delivers one sent with `send_here`) runs its job on this thread, after the
+    /// jobs queued before it, and commits and replies as on the worker
+    #[test]
+    fn an_exec_taken_here_runs_its_job_on_this_thread_after_the_jobs_before_it() {
+        let tx = ready(&rw_pages(4));
+        with_fifo(&tx, 1);
+        tx.p.world()
+            .set_auto_complete(Some(crate::testkit::CompleteOn::Thread));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let o = order.clone();
+        tx.task.job(move |_, _| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            o.lock().push(("earlier", std::thread::current().id()));
+        });
+        let o = order.clone();
+        let reply = Reply::new(move |v: (u32, Option<Vec<u8>>, u32)| {
+            assert_eq!(v.0, 1);
+            o.lock().push(("exec", std::thread::current().id()));
+        });
+        let mark = tx.p.call_log().mark();
+        let ran = tx
+            .life
+            .run(|| tx.task.on_message_here(exec_message(1, 0, 0x77, reply)));
+        assert_eq!(ran, Some(()));
+        let order = order.lock().clone();
+        let here = std::thread::current().id();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0].0, "earlier");
+        assert_ne!(order[0].1, here);
+        assert_eq!(order[1], ("exec", here));
+        let sels = tx.p.call_log().sels_since(mark);
+        let pos = |s: &str| sels.iter().position(|x| *x == s).unwrap();
+        assert!(pos("addCompletedHandler:") < pos("encodeSignalEventScheduled:value:"));
+        assert!(pos("encodeSignalEventScheduled:value:") < pos("commit"));
+        assert_eq!(tx.task.fifos.lock()[&1].signaled.load(Ordering::SeqCst), 1);
+        tx.settle();
+    }
+
+    /// A death in a job taken here unwinds to the delivery's run, which ends the task; the
+    /// service queue is given up on the way, and the thread leaves the task's code
+    #[test]
+    fn a_death_in_a_job_taken_here_ends_the_task_and_gives_the_queue_up() {
+        let tx = ready(&rw_pages(4));
+        let after = AtomicBool::new(false);
+        let ran = tx.life.run(|| {
+            tx.task.job_on(true, |_, _| {
+                crate::fatal!(DeathKind::SyncWithoutPagingEvent)
+            });
+            after.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(ran, None);
+        // The death unwound past the rest of the delivery.
+        assert!(!after.load(Ordering::SeqCst));
+        assert!(tx.life.death().is_some());
+        assert!(TaskLife::current().is_none());
+        // The queue was given up: a sync takes it at once.
+        tx.task.queue.sync(|| ());
+        // Later jobs of the ended task run nothing.
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        tx.task.job(move |_, _| r.store(true, Ordering::SeqCst));
+        tx.settle();
+        assert!(!ran.load(Ordering::SeqCst));
     }
 
     /// A wait value other than the last signalled one makes the exec wait on the FIFO

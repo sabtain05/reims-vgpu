@@ -3,11 +3,15 @@
 //! pending replies.
 //!
 //! - **The connection queue** delivers the host's messages to the service one at a time, in send
-//!   order, each as the task's code (`TaskLife::run`); the handshake runs there. The task's end
-//!   runs there too: the service's state is released, then the host is told.
+//!   order, each as the task's code (`TaskLife::run`); the handshake runs there. A message sent
+//!   with `send_here` is delivered in the same order on the sender's thread, which holds the
+//!   queue while the service takes it. The task's end runs there too: the service's state is
+//!   released, then the host is told.
 //! - **The link's queue** makes every `HostSide` call and runs every reply, one at a time, in the
 //!   order the service sent them. A message or reply the service hands over while the task runs
-//!   is always delivered, before the end the host is told of.
+//!   is always delivered, before the end the host is told of. The reply to a message sent with
+//!   `send_here`, made on the sender's thread while the queue is idle with nothing queued, runs
+//!   there, holding the queue, in the same place in its order.
 //! - **Pending replies**: the service gets a relay in each reply's place, so the host's `Reply`
 //!   is released exactly when `ServiceLink::send` says: after its one run, right after the
 //!   interruption or invalidation, or at once for a send the link drops.
@@ -17,8 +21,9 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::thread::ThreadId;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use super::life::TaskLife;
 use crate::platform::Platform;
@@ -169,15 +174,22 @@ impl<P: Platform> Connection<P> {
         }
     }
 
-    /// One host message to the service, on the connection queue, as the task's code. A message
-    /// for a task that has ended is dropped: its relay goes, and the host's `Reply` waits in the
-    /// table for the end.
-    fn deliver(&self, m: ToService<P>) {
+    /// One host message to the service, on the connection queue, as the task's code: on the
+    /// queue's worker, or on the sender's thread holding the queue for one sent with `send_here`
+    /// (`here`, [`ServiceSide::on_message_here`]). A message for a task that has ended is
+    /// dropped: its relay goes, and the host's `Reply` waits in the table for the end.
+    fn deliver(&self, m: ToService<P>, here: bool) {
         let service = self.state.lock().service.clone();
         let Some(service) = service else {
             return;
         };
-        let _ = self.life.run(move || service.on_message(m));
+        let _ = self.life.run(move || {
+            if here {
+                service.on_message_here(m)
+            } else {
+                service.on_message(m)
+            }
+        });
     }
 
     /// Takes the host's pending `Reply` `id` out of the table.
@@ -198,7 +210,18 @@ impl<P: Platform> Connection<P> {
     /// Puts a relay in `reply`'s place and keeps the host's `Reply` in the table. The relay's
     /// first call, while the task runs, hands the `Reply` to the link's queue to run once; later
     /// calls find nothing. `false` when the table is closed (the `Reply` is then released).
-    fn relay<T: Send + 'static>(self: &Arc<Self>, reply: &mut Reply<T>) -> bool {
+    ///
+    /// The reply to a message sent with `send_here` from thread `here` runs on that thread
+    /// instead, when the service replies there and the link's queue is idle with nothing queued
+    /// ([`replies_here`]): the queue's turn, taken under the state lock, under which every
+    /// hand-over to the queue happens, is the reply's place in the queue's order, and it runs
+    /// holding the queue once the lock is released, outside the task's code, as the queue's
+    /// worker would have run it.
+    fn relay<T: Send + 'static>(
+        self: &Arc<Self>,
+        reply: &mut Reply<T>,
+        here: Option<ThreadId>,
+    ) -> bool {
         let id = self.next_reply.fetch_add(1, Ordering::Relaxed);
         let weak = Arc::downgrade(self);
         let original = std::mem::replace(
@@ -219,6 +242,15 @@ impl<P: Platform> Connection<P> {
                 else {
                     return;
                 };
+                if here.is_some_and(|t| t == std::thread::current().id())
+                    && replies_here()
+                    && let Some(turn) = conn.link_queue.hold_if_idle()
+                {
+                    drop(state);
+                    // The host's side, as on the link queue's worker: outside the task's code.
+                    super::life::outside_the_task(|| turn.run(move || r.call(v)));
+                    return;
+                }
                 conn.to_host(HostEvent::Reply(Box::new(move || r.call(v))));
                 drop(state);
             }),
@@ -237,14 +269,15 @@ impl<P: Platform> Connection<P> {
         }
     }
 
-    /// Relays the reply of `m`, if it has one.
-    fn relay_message(self: &Arc<Self>, m: &mut ToService<P>) {
+    /// Relays the reply of `m`, if it has one; `here` is the sender's thread for a message sent
+    /// with `send_here`.
+    fn relay_message(self: &Arc<Self>, m: &mut ToService<P>, here: Option<ThreadId>) {
         match m {
             ToService::Handshake { reply, .. } => {
-                self.relay(reply);
+                self.relay(reply, here);
             }
             ToService::ExecIndirect3 { reply, .. } => {
-                self.relay(reply);
+                self.relay(reply, here);
             }
             ToService::FlushResources { reply }
             | ToService::UnmapMemory { reply, .. }
@@ -260,35 +293,90 @@ impl<P: Platform> Connection<P> {
             | ToService::InfoIndirect { reply, .. }
             | ToService::ResetRasterizationRateMap { reply, .. }
             | ToService::FifoDeleted { reply, .. } => {
-                self.relay(reply);
+                self.relay(reply, here);
             }
             ToService::SetFifoEvent { .. } => {}
         }
     }
 }
 
+/// Whether the reply to a message sent with `send_here` runs on the sender's thread when the
+/// service replies there with the link's queue idle ([`Connection::relay`]): on, unless
+/// `REIMS_VGPU_TASK_INLINE_REPLY` is `0`, read once per process, when the link queue's worker
+/// runs it, as every other reply. The FIFO thread then finds its exec's reply run when the job
+/// returns, and neither the link queue's worker nor the FIFO thread is woken for it.
+fn replies_here() -> bool {
+    static HERE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var_os("REIMS_VGPU_TASK_INLINE_REPLY").is_some_and(|v| v == "0")
+    });
+    #[cfg(test)]
+    if let Some(here) = REPLIES_HERE.with(std::cell::Cell::get) {
+        return here;
+    }
+    *HERE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether replies on this thread run here, in place of the process's switch
+    /// ([`replies_here`]).
+    pub(crate) static REPLIES_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The host's end of one task's connection.
 pub(super) struct Link<P: Platform>(pub(super) Arc<Connection<P>>);
 
-impl<P: Platform> ServiceLink<P> for Link<P> {
-    fn send(&self, mut m: ToService<P>) {
+impl<P: Platform> Link<P> {
+    /// `m` with its reply relayed, under the state lock it answers with, or `None` once the
+    /// connection has ended: `m` is then dropped, its `Reply` released at once, unrun, and the
+    /// first send after the task's death also invalidates the connection. `here` is the sender's
+    /// thread for a message sent with `send_here`.
+    fn admit(
+        &self,
+        mut m: ToService<P>,
+        here: Option<ThreadId>,
+    ) -> Option<(ToService<P>, MutexGuard<'_, State<P>>)> {
         let conn = &self.0;
         let state = conn.state.lock();
         if state.ended {
             let invalidate = !state.invalidated;
             drop(state);
-            // Dropped, its `Reply` released at once, unrun.
             drop(m);
-            // The first send after the task's death also invalidates the connection.
             if invalidate {
                 self.invalidate();
             }
-            return;
+            return None;
         }
-        conn.relay_message(&mut m);
-        let c = Arc::clone(conn);
-        conn.connection_queue.exec_async(move || c.deliver(m));
+        conn.relay_message(&mut m, here);
+        Some((m, state))
+    }
+}
+
+impl<P: Platform> ServiceLink<P> for Link<P> {
+    fn send(&self, m: ToService<P>) {
+        let Some((m, state)) = self.admit(m, None) else {
+            return;
+        };
+        let c = Arc::clone(&self.0);
+        self.0
+            .connection_queue
+            .exec_async(move || c.deliver(m, false));
         drop(state);
+    }
+
+    /// The connection queue's `sync`: the delivery runs on this thread once every message
+    /// queued before it has been delivered, holding the queue until the service returns. The
+    /// queue is taken after the state lock is released, since the service's own sends take that
+    /// lock. An end queued in between runs first: `m` then finds no service, and its `Reply`,
+    /// already in the table, goes with the end's release, unrun.
+    fn send_here(&self, m: ToService<P>) {
+        let Some((m, state)) = self.admit(m, Some(std::thread::current().id())) else {
+            return;
+        };
+        drop(state);
+        let c = Arc::clone(&self.0);
+        self.0.connection_queue.sync(move || c.deliver(m, true));
     }
 
     fn invalidate(&self) {

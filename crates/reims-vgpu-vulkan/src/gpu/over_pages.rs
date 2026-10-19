@@ -67,6 +67,7 @@
 //! textures of those kinds (its `Depth32Float_Stencil8` render targets at offset 0 of a heap of
 //! their own) lie in heaps whose pages no other record of the case lies over.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -235,7 +236,7 @@ fn holding(ranges: &[Range<u64>], range: &Range<u64>) -> bool {
 pub(crate) struct Site {
     seen: Option<Arc<Seen>>,
     bytes: Range<u64>,
-    fixed: Vec<Range<u64>>,
+    fixed: Arc<[Range<u64>]>,
 }
 
 impl Site {
@@ -244,7 +245,7 @@ impl Site {
         Site {
             seen: Some(Arc::clone(&heap.backing.seen)),
             bytes,
-            fixed: Vec::new(),
+            fixed: Arc::new([]),
         }
     }
 
@@ -272,24 +273,31 @@ impl Site {
         Site {
             seen: Some(Arc::clone(&buffer.backing.seen)),
             bytes,
-            fixed: crate::remap::as_guests(contents.unwrap_or_default()),
+            fixed: crate::remap::as_guests(contents.unwrap_or_default()).into(),
         }
     }
 
     /// Host memory that stays while the texture lives: a surface's.
     pub(crate) fn fixed(memory: Vec<Range<u64>>) -> Site {
+        Site::named(crate::remap::as_guests(memory).into())
+    }
+
+    /// [`Site::fixed`], of memory already named as the guest's pages are
+    /// ([`crate::remap::as_guests`]).
+    pub(crate) fn named(memory: Arc<[Range<u64>]>) -> Site {
         Site {
             seen: None,
             bytes: 0..0,
-            fixed: crate::remap::as_guests(memory),
+            fixed: memory,
         }
     }
 
-    /// The host memory the texels lie in now.
-    fn memory(&self) -> Vec<Range<u64>> {
-        (self.seen.as_ref())
-            .and_then(|seen| seen.memory(&self.bytes))
-            .unwrap_or_else(|| self.fixed.clone())
+    /// The host memory the texels lie in now: `fixed` as it is, with no copy, where it is theirs.
+    fn memory(&self) -> Cow<'_, [Range<u64>]> {
+        match (self.seen.as_ref()).and_then(|seen| seen.memory(&self.bytes)) {
+            Some(memory) => Cow::Owned(memory),
+            None => Cow::Borrowed(&self.fixed),
+        }
     }
 
     /// Whether the texels lie in the heap or buffer `seen` is of.
@@ -473,8 +481,7 @@ impl Watch {
         registry
             .apart
             .retain(|apart| apart.texture.strong_count() > 0);
-        let memory = site.memory();
-        let clash = registry.against(&site, &memory, why);
+        let clash = registry.against(&site, &site.memory(), why);
         between();
         if clash.is_ok() {
             registry.apart.push(Apart { texture, site, why });
@@ -497,8 +504,7 @@ impl Watch {
         between: impl FnOnce(),
     ) -> Result<(), Clash> {
         let mut registry = self.registry.lock();
-        let memory = site.memory();
-        let clash = registry.under(site.seen.as_ref(), &memory);
+        let clash = registry.under(site.seen.as_ref(), &site.memory());
         between();
         if clash.is_ok() {
             registry.keep(Other { texture, site });
@@ -625,9 +631,10 @@ pub(crate) fn over_buffer(
 }
 
 /// A texture `texture`, made by `sel` on a surface made over the guest's pages, whose texels lie
-/// in `memory`: as [`over_buffer`]'s.
-pub(crate) fn over_surface(sel: &'static str, memory: Vec<Range<u64>>, texture: Texture) {
-    if let Err(clash) = WATCH.other(Site::fixed(memory), texture) {
+/// in `memory`, named as the guest's pages are ([`crate::remap::as_guests`]): as
+/// [`over_buffer`]'s.
+pub(crate) fn over_surface(sel: &'static str, memory: Arc<[Range<u64>]>, texture: Texture) {
+    if let Err(clash) = WATCH.other(Site::named(memory), texture) {
         clash.dies(sel);
     }
 }
@@ -687,7 +694,7 @@ mod tests {
         Site {
             seen: Some(Arc::clone(seen)),
             bytes,
-            fixed: Vec::new(),
+            fixed: Arc::new([]),
         }
     }
 
@@ -1006,5 +1013,30 @@ mod tests {
         });
         assert_eq!(first, Ok(()), "beside the page");
         assert!(placed.is_err() != second.is_err(), "{placed:?} {second:?}");
+    }
+
+    /// Prints how long a texture made on a surface over the guest's pages takes to be named and
+    /// kept here, as `newTextureWithDescriptor:iosurface:plane:` has it, while no texture is kept
+    /// apart: its memory ([`crate::os::surface_bytes_memory`]), its site and its keeping
+    /// ([`over_surface`]'s); for a surface made over 2,025 runs of pages, as an x86 guest's
+    /// 1920 × 1080 surface is, beside 2,000 runs of core's mappings
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the time a call"]
+    fn a_texture_on_a_surface_over_2025_runs() {
+        use reims_vgpu_core::platform::os::surface::Surface as _;
+
+        let (s, pages, length) = crate::os::tests::bgra_surface_over_runs(2025);
+        crate::remap::guest_mappings_for_measurements(0x7000_0000_0000, 2000, 0x10_0000_0000);
+        let watch = Watch::new();
+        let bytes = [0..s.alloc_size()];
+        let rounds = crate::os::tests::microseconds_a_call(200, || {
+            let memory = crate::os::surface_bytes_memory(&s, &bytes);
+            let (t, life) = texture();
+            assert_eq!(watch.other(Site::fixed(memory), life), Ok(()));
+            drop(t);
+        });
+        println!("a texture on a surface over 2,025 runs, µs a call: {rounds:.1?}");
+        drop(s);
+        crate::os::tests::free(pages, length);
     }
 }

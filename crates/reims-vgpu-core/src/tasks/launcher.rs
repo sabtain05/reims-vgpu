@@ -55,6 +55,16 @@ pub trait ServiceLink<P: Platform>: Send + Sync {
     /// service side's `Reply` may still be called any number of times.
     fn send(&self, m: ToService<P>);
 
+    /// [`ServiceLink::send`], delivered on the caller's thread: once every message sent before
+    /// it has been delivered, the service takes it there ([`ServiceSide::on_message_here`]), and
+    /// this returns when the service has. Its `Reply` is held and run as `send`'s is, in order
+    /// with the service's other messages on the link's queue: on the caller's thread, holding
+    /// that queue, when the service replies there with the queue idle and nothing queued. By
+    /// default, `send`.
+    fn send_here(&self, m: ToService<P>) {
+        self.send(m)
+    }
+
     /// Invalidates the connection: the service ends and its state is released, before this
     /// returns unless it runs on the link's queue. Idempotent. The host side's `on_invalidated`
     /// then runs on the link's queue. The wait needs no lock the caller may hold.
@@ -89,6 +99,13 @@ pub trait HostLink<P: Platform>: Send + Sync {
 pub trait ServiceSide<P: Platform>: Send + Sync {
     /// One message from the host.
     fn on_message(&self, m: ToService<P>);
+
+    /// One message from the host, sent with [`ServiceLink::send_here`] and delivered on the
+    /// sender's thread, as the task's code: its work may run there, in its turn among the
+    /// service's. By default, [`ServiceSide::on_message`].
+    fn on_message_here(&self, m: ToService<P>) {
+        self.on_message(m)
+    }
 
     /// The task has ended (it died, or the host invalidated its connection): the service
     /// releases its state now, whoever still holds the service. By default, nothing.

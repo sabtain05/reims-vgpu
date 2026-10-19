@@ -37,6 +37,7 @@ use reims_vgpu_core::platform::os::vm::{HostAddr, KernReturn};
 use reims_vgpu_core::sync::Mutex;
 
 use super::budget;
+use super::census::{self, Kind};
 use super::files;
 use super::vm;
 
@@ -89,6 +90,7 @@ impl Drop for Twin {
         // dropped its keep-alive, or the call that would import it was refused).
         unsafe { libc::munmap(vm::ptr(self.first), self.length.to_usize()) };
         budget::twins_hold(self.mappings, false);
+        census::changed();
     }
 }
 
@@ -250,6 +252,7 @@ fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
     budget::twins_hold(mappings, true);
     twin.mappings = mappings;
     TWINS.lock().insert(base, (length, first));
+    census::made(Kind::Twin);
     Some(twin)
 }
 

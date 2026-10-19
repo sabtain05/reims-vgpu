@@ -37,7 +37,10 @@
 //! (`buffer_over_surface_at` in [`crate::gpu::device`]). The runtime lets no buffer lie in the
 //! import of a heap's bytes or of the memory a rebound buffer takes, and a surface's alias is
 //! released by the keep-alive of the last buffer over it, which the runtime drops after it freed
-//! that buffer's import, so no buffer made later at the address could lie in one.
+//! that buffer's import, so no buffer made later at the address could lie in one. A detached
+//! object's alias parked on Linux, and its views made again, report nothing either: it is parked
+//! only once the runtime freed every import of it, and its views come back over the same pages
+//! before it is imported again ([`crate::gpu::backing`]'s `Parking`).
 //!
 //! **Not reported**: the pages of the host's own RAM a memory map names, which core reads at the
 //! host's addresses with no mapping of its own. The host changes those without the library: no call
@@ -69,28 +72,50 @@
 //! no-copy buffer this platform makes over memory it was given gives the runtime an
 //! [`UnmapHold`] on the pages in its keep-alive ([`crate::gpu::backing::keep_alive`]). While the
 //! hold lives, [`VulkanVm`]'s `deallocate` of pages it meets reports them, as every unmap does,
-//! answers success and leaves them mapped; the hold's drop, after the free, unmaps them, whole,
-//! once no other hold meets them. So the pages go after the import, as they did when the runtime
-//! ran the deallocator after the free, and the deallocator, which is the guest's and the host's
-//! (core's mapping's release, and with it what the host sees), stays at Metal's moment.
+//! answers success and leaves them mapped; the hold's drop, after the free, has them unmapped,
+//! whole, once no other hold meets them, by the unmap thread (below). So the pages go after the
+//! import, as they did when the runtime ran the deallocator after the free, and the deallocator,
+//! which is the guest's and the host's (core's mapping's release, and with it what the host
+//! sees), stays at Metal's moment.
 //!
 //! - **Nothing waits.** `deallocate` never waits for a hold: it records the unmap under a leaf
-//!   lock and returns. The hold's drop takes the same lock, takes the unmaps no hold meets any
-//!   more, lets the lock go, and unmaps them (`munmap` or `mach_vm_deallocate`), calling nothing
-//!   else. So neither side waits for another thread, and no thread can wait on a hold whose drop
-//!   needs it, or a thread it blocks: not core's FIFO threads, which release buffers and so may
-//!   run core's deallocators, nor a vCPU thread of QEMU's that holds its BQL inside a call of
-//!   the C API. The calls of `deallocate` are core's: a mapping's last release on the thread that
-//!   lets it go (a FIFO thread, an isolated task's thread, the host's thread inside a call, or the
-//!   runtime's thread that runs a buffer's deallocator, the releasing thread or one of its
-//!   handler threads as a command buffer completes), a detach temporary's, a failed map's, and
-//!   a mapping task's whole range at its release. The holds go on the runtime's thread that frees
-//!   the import: the releasing thread, or a handler thread once the last command buffer that held
-//!   the import completed, or the creating thread where the runtime refused the call.
-//! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
-//!   gives no range over them meanwhile. Core deallocates only whole ranges it made and never
-//!   reaches again, so nothing maps over a waiting unmap but a fixed overwrite, which takes those
-//!   pages out of it (`Holds::replaced`).
+//!   lock and returns. The hold's drop takes the same lock, leaves the unmaps no hold meets any
+//!   more to the unmap thread, lets the lock go and wakes the thread, which takes them under the
+//!   lock, lets it go, and unmaps them (`munmap` or `mach_vm_deallocate`), calling nothing else.
+//!   So no side waits for another thread, but the unmap thread for work, and no thread can wait
+//!   on a hold whose drop needs it, or a thread it blocks: not core's FIFO threads, which release
+//!   buffers and so may run core's deallocators, nor a vCPU thread of QEMU's that holds its BQL
+//!   inside a call of the C API. The calls of `deallocate` are core's: a mapping's last release on
+//!   the thread that lets it go (a FIFO thread, an isolated task's thread, the host's thread inside
+//!   a call, or the runtime's thread that runs a buffer's deallocator, the releasing thread or one
+//!   of its handler threads as a command buffer completes), a detach temporary's, a failed map's,
+//!   and a mapping task's whole range at its release. The holds go on the runtime's thread that
+//!   frees the import: the releasing thread, or a handler thread once the last command buffer that
+//!   held the import completed, or the creating thread where the runtime refused the call.
+//! - **The unmap thread** (`reims-vgpu.unmap`, [`unmap_thread`]), started at the first hold's
+//!   drop, makes every unmap left to it each time it wakes. A hold often goes inside the guest's
+//!   delete of a resource (core's `Task::delete_resource`, whose release of the resource frees
+//!   the import), on a FIFO thread that holds the task's unique lock while the other FIFOs'
+//!   commands over the task wait for its shared side: an unmap there, a TLB shootdown across the
+//!   process's threads, held those commands back. Measured on an Iris Xe (Linux, i915) under a
+//!   macOS guest, in profiles of QEMU's FIFO threads: the unmap took about 0.57 ms a frame of the
+//!   delete's 0.84 ms, while the busiest other FIFO thread waited about 0.94 ms a frame for the
+//!   lock. Nothing the guest or host observes changes: the pages are the library's own mapping of
+//!   the guest's, no host callback runs, and the C API names no thread for it.
+//!   `REIMS_VGPU_UNMAP_THREAD` set to `0`, read once per process ([`unmaps_on_thread`]), has the
+//!   hold's drop unmap them itself, as it does where the OS refused the thread.
+//! - **What it keeps.** The pages stay mapped, at their address, until the hold goes and their
+//!   unmap is made: the kernel gives no range over them meanwhile. Core deallocates only whole
+//!   ranges it made and never reaches again, so nothing maps over a waiting unmap, or one left to
+//!   the unmap thread, but a fixed overwrite, which takes those pages out of it
+//!   (`Holds::replaced`). No hold defers an overwrite (`allocate_fixed_overwrite`,
+//!   `remap_shared_overwrite`), so its target must never lie in a live import, and none does: it
+//!   is a fresh range no import was made of yet, or a mapping task's, which core makes no buffer
+//!   over. One there would change the pages under the import. Measured by metal2vulkan's probe
+//!   for a host-pointer import on a Radeon 780M (RADV of Mesa 26.2.4, Linux 7.2.9, 2026-10-19):
+//!   a `MAP_FIXED` of one page inside a live import waited 125 ms for a 126 ms job in flight,
+//!   against 5 to 16 µs idle, and an `munmap` of one page there failed the next submission with
+//!   `EFAULT`, the device lost.
 //! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the host's or
 //!   the system's, which no hold defers: the host's own mapping in a device without a memory map
 //!   (`unmapMemory`, the blocks setup; QEMU passes a memory map, so a guest under QEMU never
@@ -123,14 +148,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reims_vgpu_core::host::{
     CreateTask, DestroyTask, HostBlocks, HostPtr, HostTask, MapMemory, UnmapMemory,
 };
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::sync::{Condvar, Mutex};
 
 use crate::os::OsVm;
 
@@ -156,9 +181,11 @@ fn pages(addr: HostAddr, len: u64, page: u64) -> (HostPtr, u64) {
 
 /// Core's mappings of the guest's pages (module docs): each run of a mapping's host bytes, keyed
 /// by its first byte, with its end and the first byte of the pages it shows, as the memory map
-/// names them. The runs share no byte. A leaf lock: nothing is called under it.
+/// names them, and their epoch, moved at each change of the runs, so that memory named at one
+/// epoch is named alike while the epoch stays ([`epoch`]). The runs share no byte. A leaf lock:
+/// nothing is called under it.
 #[derive(Debug, Default)]
-pub(crate) struct GuestMappings(BTreeMap<u64, (u64, u64)>);
+pub(crate) struct GuestMappings(BTreeMap<u64, (u64, u64)>, u64);
 
 /// The process's [`GuestMappings`], which [`VulkanVm`] keeps.
 static GUEST_MAPPINGS: Mutex<GuestMappings> = Mutex::new(GuestMappings::new());
@@ -166,7 +193,7 @@ static GUEST_MAPPINGS: Mutex<GuestMappings> = Mutex::new(GuestMappings::new());
 impl GuestMappings {
     /// None.
     const fn new() -> GuestMappings {
-        GuestMappings(BTreeMap::new())
+        GuestMappings(BTreeMap::new(), 0)
     }
 
     /// The run that holds the byte `at`: its first byte, end and source.
@@ -189,6 +216,7 @@ impl GuestMappings {
         self.unmapped(first, end);
         if first < end {
             self.0.insert(first, (end, source));
+            self.1 += 1;
         }
     }
 
@@ -198,6 +226,9 @@ impl GuestMappings {
             .map(|(&at, &(run_end, source))| (at, run_end, source))
             .take_while(|&(_, run_end, _)| run_end > first)
             .collect();
+        if !meeting.is_empty() {
+            self.1 += 1;
+        }
         for (at, run_end, source) in meeting {
             self.0.remove(&at);
             if at < first {
@@ -209,14 +240,40 @@ impl GuestMappings {
         }
     }
 
+    /// The bytes about `at` that lie in no run, where `at` lies in none: from the end of the run
+    /// before it, or 0, to the first byte of the run after it, or the last byte.
+    fn gap(&self, at: u64) -> Option<Range<u64>> {
+        let start = match self.0.range(..=at).next_back() {
+            Some((_, &(end, _))) if at < end => return None,
+            Some((_, &(end, _))) => end,
+            None => 0,
+        };
+        let end = (self.0.range(at..).next()).map_or(u64::MAX, |(&first, _)| first);
+        Some(start..end)
+    }
+
     /// `memory`'s ranges named by the memory map's addresses where they lie in a mapping, each
-    /// cut where a run starts or ends; any other byte as it is.
+    /// cut where a run starts or ends; any other byte as it is. A range that lies in the gap
+    /// between two runs, as the one before it did or as a lookup of its first byte finds, is
+    /// as it is without a lookup of its bytes: a surface's pages of the host's memory lie in
+    /// one gap, 2,026 ranges for an x86-64 guest's 1080p surface.
     fn named(&self, memory: Vec<Range<u64>>) -> Vec<Range<u64>> {
         if self.0.is_empty() {
             return memory;
         }
         let mut named = Vec::with_capacity(memory.len());
+        let mut gap = 0..0;
         for range in memory {
+            if range.is_empty() {
+                continue;
+            }
+            if !(gap.start <= range.start && range.end <= gap.end) {
+                gap = self.gap(range.start).unwrap_or(0..0);
+            }
+            if gap.start <= range.start && range.end <= gap.end {
+                named.push(range);
+                continue;
+            }
             let mut at = range.start;
             while at < range.end {
                 match self.holding(at) {
@@ -251,6 +308,18 @@ pub(crate) fn as_guests(memory: Vec<Range<u64>>) -> Vec<Range<u64>> {
     GUEST_MAPPINGS.lock().named(memory)
 }
 
+/// [`as_guests`], and the epoch of core's mappings it named `memory` at ([`epoch`]).
+pub(crate) fn as_guests_at(memory: Vec<Range<u64>>) -> (Vec<Range<u64>>, u64) {
+    let mappings = GUEST_MAPPINGS.lock();
+    (mappings.named(memory), mappings.1)
+}
+
+/// The epoch of core's mappings of the guest's pages now: while it stays, [`as_guests`] names
+/// any memory as it did at that epoch ([`as_guests_at`]).
+pub(crate) fn epoch() -> u64 {
+    GUEST_MAPPINGS.lock().1
+}
+
 /// Whether a byte of the `length` bytes at `first` lies in one of core's mappings of the
 /// guest's pages.
 pub(crate) fn shows_guest_pages(first: HostPtr, length: u64) -> bool {
@@ -259,14 +328,21 @@ pub(crate) fn shows_guest_pages(first: HostPtr, length: u64) -> bool {
     !memory.is_empty() && GUEST_MAPPINGS.lock().shows(&memory)
 }
 
-/// The process's holds on pages runtime imports cover, and the unmaps that wait for them
-/// ([`UnmapHold`]). A leaf lock: nothing is called under it.
+/// The process's holds on pages runtime imports cover, the unmaps that wait for them
+/// ([`UnmapHold`]), and those left to the unmap thread ([`unmap_thread`]). A leaf lock: nothing
+/// is called under it.
 static HOLDS: Mutex<Holds> = Mutex::new(Holds::new());
+
+/// Wakes the unmap thread: an unmap was left to it.
+static QUEUED: Condvar = Condvar::new();
+
+/// Wakes what waits for the unmap thread to make what it took ([`unmaps_made`], the tests').
+static MADE: Condvar = Condvar::new();
 
 /// A hold on the host pages a runtime import covers, which the runtime is given in a no-copy
 /// buffer's keep-alive: while it lives, [`VulkanVm`]'s `deallocate` of pages it meets leaves them
-/// mapped, and its drop, which the runtime makes once it freed the import, unmaps them (module
-/// docs, "Unmaps an import waits for").
+/// mapped, and its drop, which the runtime makes once it freed the import, has them unmapped
+/// (module docs, "Unmaps an import waits for").
 #[derive(Debug)]
 pub(crate) struct UnmapHold {
     /// The first byte of its pages.
@@ -287,18 +363,109 @@ impl UnmapHold {
 }
 
 impl Drop for UnmapHold {
-    /// Unmaps what waited for this hold and no other: under no lock, calling nothing else.
+    /// Lets the hold go, its unmaps left to the unmap thread unless the environment turns it off
+    /// ([`release`]).
     fn drop(&mut self) {
-        let free = HOLDS.lock().release(self.first, self.id);
-        if free.is_empty() {
-            return;
-        }
-        let vm = OsVm::new();
-        for pages in free {
-            let at = HostPtr::from_addr(pages.start.to_usize());
-            let _ = vm.deallocate(at, pages.end - pages.start);
-        }
+        release(self.first, self.id, unmaps_on_thread());
     }
+}
+
+/// Lets the hold `id` on the pages from `first` go, and has what waited for it and no other hold
+/// unmapped: where `on_thread`, by the unmap thread, queued under the lock and the thread woken
+/// once it is let go; else, or where the OS refused the thread, here, under no lock. Calls
+/// nothing else.
+fn release(first: u64, id: u64, on_thread: bool) {
+    let on_thread = on_thread && unmap_thread();
+    let mut holds = HOLDS.lock();
+    let free = holds.release(first, id);
+    if free.is_empty() {
+        return;
+    }
+    if on_thread {
+        holds.queue(free);
+        drop(holds);
+        QUEUED.notify_one();
+    } else {
+        drop(holds);
+        unmap(&free);
+    }
+}
+
+/// Unmaps `free`, ranges of whole pages no hold meets.
+fn unmap(free: &[Range<u64>]) {
+    let vm = OsVm::new();
+    for pages in free {
+        let at = HostPtr::from_addr(pages.start.to_usize());
+        let _ = vm.deallocate(at, pages.end - pages.start);
+    }
+}
+
+/// Whether a hold's drop leaves its unmaps to the unmap thread (module docs): by default.
+/// `REIMS_VGPU_UNMAP_THREAD` set to `0`, read once per process, turns it off, and the drop unmaps
+/// them itself, where the runtime freed the import.
+fn unmaps_on_thread() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var_os("REIMS_VGPU_UNMAP_THREAD").is_some_and(|v| v == "0")
+    });
+    *ON
+}
+
+/// Whether the unmap thread runs, `reims-vgpu.unmap`, started at the first call: `false` where
+/// the OS refused it, with a warning, and every hold's drop then unmaps its pages itself.
+fn unmap_thread() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        let made = std::thread::Builder::new()
+            .name("reims-vgpu.unmap".into())
+            .spawn(unmap_forever);
+        if let Err(e) = &made {
+            log::warn!("no unmap thread: {e}; an import's pages are unmapped as it is freed");
+        }
+        made.is_ok()
+    })
+}
+
+/// The unmap thread: each time it is woken, every unmap left to it, made under no lock, calling
+/// nothing else. It drops the scheduler hints it inherited from the thread that started it, a
+/// FIFO thread or one of the runtime's ([`crate::os::drop_inherited_hints`]).
+fn unmap_forever() {
+    crate::os::drop_inherited_hints();
+    loop {
+        let taken = {
+            let mut holds = HOLDS.lock();
+            holds.made();
+            MADE.notify_all();
+            while !holds.queued() {
+                QUEUED.wait(&mut holds);
+            }
+            holds.take_queued()
+        };
+        unmap(&taken);
+        #[cfg(test)]
+        MADE_ON_THREAD.lock().extend(taken);
+    }
+}
+
+/// The unmaps the unmap thread made, for tests.
+#[cfg(test)]
+static MADE_ON_THREAD: Mutex<Vec<Range<u64>>> = Mutex::new(Vec::new());
+
+/// How many times the unmap thread made an unmap of exactly `pages`, for tests.
+#[cfg(test)]
+fn made_on_thread(pages: &Range<u64>) -> usize {
+    (MADE_ON_THREAD.lock().iter())
+        .filter(|made| *made == pages)
+        .count()
+}
+
+/// The unmaps that wait for a hold now, each a range of whole pages: the census of the views'
+/// mappings names them (on Linux, `crate::os`'s `census`).
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only Linux's census reads it")
+)]
+pub(crate) fn waiting_unmaps() -> Vec<Range<u64>> {
+    HOLDS.lock().waiting.clone()
 }
 
 /// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, for tests.
@@ -318,6 +485,41 @@ pub(crate) fn guest_mappings_of(source: Range<u64>) -> Vec<Range<u64>> {
         .filter(|&(&first, &(end, from))| from < source.end && source.start < from + (end - first))
         .map(|(&first, &(end, _))| first..end)
         .collect()
+}
+
+/// Records the host bytes `first..end` as a run of core's mappings of the guest's pages showing
+/// pages from `source`, or, with no `source`, as showing none of them from now on, as a remap or
+/// an unmap through [`VulkanVm`] records them, with no mapping made or unmade, for tests.
+#[cfg(test)]
+pub(crate) fn guest_mapping_for_tests(first: u64, end: u64, source: Option<u64>) {
+    let mut mappings = GUEST_MAPPINGS.lock();
+    match source {
+        Some(source) => mappings.mapped(first, end, source),
+        None => mappings.unmapped(first, end),
+    }
+}
+
+/// Records `count` runs of core's mappings of the guest's pages from the host byte `first`, each
+/// a page of every other one, showing pages from `source`, as a remap through [`VulkanVm`]
+/// records them, with no mapping made, for measurements.
+#[cfg(test)]
+pub(crate) fn guest_mappings_for_measurements(first: u64, count: u64, source: u64) {
+    let page = OsVm::new().page_size();
+    let mut mappings = GUEST_MAPPINGS.lock();
+    for i in 0..count {
+        let at = first + 2 * i * page;
+        mappings.mapped(at, at + page, source + i * page);
+    }
+}
+
+/// Waits until the unmap thread has made every unmap left to it, for tests: a hold's drop leaves
+/// its unmaps to the thread, so the pages may still be mapped as the drop returns.
+#[cfg(test)]
+pub(crate) fn unmaps_made() {
+    let mut holds = HOLDS.lock();
+    while holds.unmapping() {
+        MADE.wait(&mut holds);
+    }
 }
 
 /// The platform's `HostVm`: the OS's ([`OsVm`]: Mach VM on macOS, its calls over `mmap` on
@@ -382,6 +584,8 @@ impl HostVm for VulkanVm {
         Ok(at)
     }
 
+    /// Made at once, whatever hold meets the pages: its target must never lie in a live import
+    /// (module docs, "What it keeps").
     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
         self.vm.allocate_fixed_overwrite(addr, len)?;
         let pages = self.changed(addr, len);
@@ -389,6 +593,8 @@ impl HostVm for VulkanVm {
         Ok(())
     }
 
+    /// Made at once, whatever hold meets the pages: its target must never lie in a live import
+    /// (module docs, "What it keeps").
     fn remap_shared_overwrite(
         &self,
         dst: HostAddr,
@@ -643,6 +849,117 @@ mod tests {
         assert!(m.0.is_empty());
     }
 
+    /// `memory` named run by run, a cut where a run starts or ends: [`GuestMappings::named`]
+    /// without its shortcut for a range in a gap between runs.
+    fn named_by_cuts(m: &GuestMappings, memory: Vec<Range<u64>>) -> Vec<Range<u64>> {
+        if m.0.is_empty() {
+            return memory;
+        }
+        let mut named = Vec::with_capacity(memory.len());
+        for range in memory {
+            let mut at = range.start;
+            while at < range.end {
+                match m.holding(at) {
+                    Some((first, end, source)) => {
+                        let to = end.min(range.end);
+                        named.push(source + (at - first)..source + (to - first));
+                        at = to;
+                    }
+                    None => {
+                        let next = m.0.range(at..).next().map(|(&first, _)| first);
+                        let to = next.unwrap_or(u64::MAX).min(range.end);
+                        named.push(at..to);
+                        at = to;
+                    }
+                }
+            }
+        }
+        named
+    }
+
+    /// The shortcut for memory that meets no run names it as the cuts do: ranges that meet a
+    /// run, end where one starts, start where one ends, span adjacent runs or the gap between
+    /// two, lie inside one, are empty, or lie before or past them all, alone and together
+    #[test]
+    #[expect(
+        clippy::reversed_empty_ranges,
+        reason = "a reversed range is one of the edges"
+    )]
+    fn named_answers_as_the_cuts_do() {
+        let mut m = GuestMappings::new();
+        // Adjacent runs, a gap, and a run past it.
+        m.mapped(0x10_0000, 0x10_4000, 0x90_0000);
+        m.mapped(0x10_4000, 0x10_8000, 0x70_0000);
+        m.mapped(0x10_c000, 0x11_0000, 0x50_0000);
+        let edges = [
+            0x0..0x1000,
+            0xf_f000..0x10_0000,
+            0xf_f000..0x10_0001,
+            0x10_0000..0x10_0000,
+            0x10_1000..0x10_1000,
+            0x10_1000..0x10_2000,
+            0x10_3000..0x10_5000,
+            0x10_8000..0x10_c000,
+            0x10_8000..0x10_8000,
+            0x10_7fff..0x10_8001,
+            0x10_bfff..0x10_c000,
+            0x10_bfff..0x10_c001,
+            0x11_0000..0x12_0000,
+            0x10_c000..0x10_c000,
+            0xf_0000..0x12_0000,
+            0x10_2000..0x10_1000,
+        ];
+        for range in &edges {
+            let memory = vec![range.clone()];
+            assert_eq!(
+                m.named(memory.clone()),
+                named_by_cuts(&m, memory),
+                "{range:#x?}"
+            );
+        }
+        let apart: Vec<_> = (edges.iter())
+            .filter(|r| !m.shows(r) || r.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(m.named(apart.clone()), named_by_cuts(&m, apart.clone()));
+        assert_eq!(m.named(edges.to_vec()), named_by_cuts(&m, edges.to_vec()));
+        // A walk over every start and end around the runs, a quarter page apart, after and
+        // before a range in each gap: before the runs, between two, and past them.
+        let points: Vec<u64> = (0xf_c000..0x11_4000).step_by(0x1000 / 4).collect();
+        let gaps = [0x0..0x1000, 0x10_9000..0x10_a000, 0x20_0000..0x20_1000];
+        for &start in &points {
+            for &end in &points {
+                for gap in &gaps {
+                    for memory in [vec![start..end, gap.clone()], vec![gap.clone(), start..end]] {
+                        let named = named_by_cuts(&m, memory.clone());
+                        assert_eq!(m.named(memory.clone()), named, "{memory:#x?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prints how long `as_guests` takes for 2,026 ranges that meet no run, a surface's own
+    /// memory and its 2,025 pages of the host's, beside 2,000 runs of core's mappings, as on an
+    /// x86 guest's host while it draws; with the copy of the ranges each call takes
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the time a call"]
+    fn as_guests_over_2026_ranges_meeting_no_run() {
+        let page = OsVm::new().page_size();
+        guest_mappings_for_measurements(0x7000_0000_0000, 2000, 0x10_0000_0000);
+        let own = 0x6000_0000_0000..0x6000_0000_0000 + 2025 * page;
+        let pages = (0..2025).map(|i| {
+            let at = 0x5000_0000_0000 + 2 * i * page;
+            at..at + page
+        });
+        let memory: Vec<Range<u64>> = std::iter::once(own).chain(pages).collect();
+        assert_eq!(as_guests(memory.clone()), memory);
+        let rounds = crate::os::tests::microseconds_a_call(200, || {
+            std::hint::black_box(as_guests(std::hint::black_box(memory.clone())));
+        });
+        println!("as_guests over 2,026 ranges beside 2,000 runs, µs a call: {rounds:.1?}");
+    }
+
     /// The platform's remap names its range by the source's pages from the remap, and a
     /// deallocate of the range ends it: a buffer over it then lies over memory of its own
     #[test]
@@ -828,10 +1145,28 @@ mod tests {
         );
     }
 
+    /// The byte the hold tests write into the pages they map.
+    const WRITTEN: u8 = 0xa5;
+
+    /// Whether the page at `p`, which a hold test mapped and filled with [`WRITTEN`], was
+    /// unmapped. Unmapped pages may be mapped again at once by another test's thread, so an
+    /// unmap shows as the page unmapped or no longer holding the byte written there.
+    fn gone(p: HostPtr) -> bool {
+        // SAFETY: a read of a page that is mapped, the test's or another's.
+        !crate::os::mapped(p) || unsafe { p.as_ptr::<u8>().read_volatile() } != WRITTEN
+    }
+
+    /// `length` bytes of fresh pages from `vm`, filled with [`WRITTEN`].
+    fn written(vm: &VulkanVm, length: u64) -> HostPtr {
+        let at = vm.allocate_anywhere(length).unwrap();
+        // SAFETY: pages just mapped, readable and writable.
+        unsafe { std::ptr::write_bytes(at.as_ptr::<u8>(), WRITTEN, length.to_usize()) };
+        at
+    }
+
     /// A `deallocate` of pages a hold meets reports them at the call and answers success,
-    /// leaving them mapped until the hold goes, which unmaps them; one of pages no hold meets
-    /// unmaps at once. Unmapped pages may be mapped again at once by another test's thread, so
-    /// an unmap shows as pages unmapped or no longer holding the bytes written there
+    /// leaving them mapped until the hold goes, which has them unmapped; one of pages no hold
+    /// meets unmaps at once
     #[test]
     fn an_unmap_of_held_pages_waits_for_the_hold() {
         let vm = VulkanVm {
@@ -839,17 +1174,9 @@ mod tests {
             report: seen,
         };
         let page = vm.page_size();
-        let at = vm.allocate_anywhere(2 * page).unwrap();
-        let other = vm.allocate_anywhere(page).unwrap();
-        for (p, length) in [(at, 2 * page), (other, page)] {
-            // SAFETY: pages this test just mapped, readable and writable.
-            unsafe { std::ptr::write_bytes(p.as_ptr::<u8>(), 0xa5, length.to_usize()) };
-        }
+        let at = written(&vm, 2 * page);
+        let other = written(&vm, page);
         let _ = take();
-        let gone = |p: HostPtr| {
-            // SAFETY: a read of a page that is mapped, the first test's.
-            !crate::os::mapped(p) || unsafe { p.as_ptr::<u8>().read_volatile() } != 0xa5
-        };
         let first = NonNull::new(at.wrapping_add(0x10).as_ptr::<u8>()).unwrap();
         let hold = UnmapHold::new(first, page);
         assert!(vm.deallocate(other, page).is_success());
@@ -868,10 +1195,60 @@ mod tests {
         );
         drop(hold);
         assert!(!unmap_waits(at, 2 * page));
+        unmaps_made();
         assert!(
             gone(at) && gone(at.wrapping_add(page)),
-            "unmapped as the hold went"
+            "unmapped once the hold went"
         );
+    }
+
+    /// A hold's drop, by default ([`release`] with the thread on), leaves the unmaps it frees to
+    /// the unmap thread, and returns: the thread unmaps the pages, whole, and they are gone once
+    /// it made every unmap left to it
+    #[test]
+    fn a_holds_drop_leaves_its_unmap_to_the_unmap_thread() {
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: seen,
+        };
+        let page = vm.page_size();
+        let at = written(&vm, 2 * page);
+        let first = at.addr().to_u64();
+        let pages = first..first + 2 * page;
+        let bytes = NonNull::new(at.wrapping_add(page).as_ptr::<u8>()).unwrap();
+        let hold = std::mem::ManuallyDrop::new(UnmapHold::new(bytes, 1));
+        assert!(vm.deallocate(at, 2 * page).is_success());
+        let _ = take();
+        assert!(!gone(at) && !gone(at.wrapping_add(page)), "still mapped");
+        let before = made_on_thread(&pages);
+        release(hold.first, hold.id, true);
+        assert!(!unmap_waits(at, 2 * page), "no hold meets it any more");
+        unmaps_made();
+        assert!(made_on_thread(&pages) > before, "the unmap thread made it");
+        assert!(
+            gone(at) && gone(at.wrapping_add(page)),
+            "unmapped once the thread made it"
+        );
+    }
+
+    /// Without the unmap thread a hold's drop unmaps the pages it frees itself, before it
+    /// returns, as `REIMS_VGPU_UNMAP_THREAD=0` has it
+    #[test]
+    fn without_the_unmap_thread_a_holds_drop_unmaps_itself() {
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: seen,
+        };
+        let page = vm.page_size();
+        let at = written(&vm, page);
+        let bytes = NonNull::new(at.as_ptr::<u8>()).unwrap();
+        let hold = std::mem::ManuallyDrop::new(UnmapHold::new(bytes, page));
+        assert!(vm.deallocate(at, page).is_success());
+        let _ = take();
+        assert!(!gone(at), "still mapped");
+        release(hold.first, hold.id, false);
+        assert!(!unmap_waits(at, page));
+        assert!(gone(at), "unmapped as the hold went");
     }
 
     /// A nil block stays nil, the blocks that change no pages are the host's own, and each

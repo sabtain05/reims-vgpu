@@ -11,8 +11,12 @@ use std::marker::PhantomData;
 
 use crate::platform::os::Threads;
 
-/// The FIFO thread's stack: 512 KiB.
-pub const FIFO_THREAD_STACK: usize = 512 * 1024;
+/// The FIFO thread's stack: 576 KiB. The FIFO thread runs an isolated task's exec job itself
+/// (`tasks::remote`), under its own frames (the loop's 512-byte barrier buffer, the command's
+/// dispatch and the two queue turns), so it has a queue worker's
+/// [`WORKER_STACK`](crate::rt::queue::WORKER_STACK), where such a job otherwise runs, and 64 KiB
+/// for those.
+pub const FIFO_THREAD_STACK: usize = crate::rt::queue::WORKER_STACK + 64 * 1024;
 
 thread_local! {
     static OURS: Cell<bool> = const { Cell::new(false) };

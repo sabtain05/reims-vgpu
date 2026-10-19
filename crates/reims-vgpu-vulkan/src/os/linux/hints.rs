@@ -32,9 +32,10 @@
 //!   kernel balances the threads of every process over every CPU.
 //!
 //! A thread inherits its creator's floor, so every other thread the library starts on Linux, a
-//! queue's worker or a display window's thread, drops it as it starts ([`drop_inherited_hints`]):
-//! a FIFO thread restarts an idle queue's worker when it submits to the queue, and the runtime's
-//! completion threads, which give themselves the same floor, may too. `SCHED_FLAG_RESET_ON_FORK`
+//! queue's worker, a display window's thread or the platform's unmap thread ([`crate::remap`]),
+//! drops it as it starts ([`drop_inherited_hints`]): a FIFO thread restarts an idle queue's worker
+//! when it submits to the queue, and the runtime's completion threads, which give themselves the
+//! same floor, may too. `SCHED_FLAG_RESET_ON_FORK`
 //! would not do it: `sched_setattr` takes the flag only with a policy, and the floor's request
 //! keeps the thread's (`SCHED_FLAG_KEEP_POLICY`). The thread asks for the kernel's own default
 //! floor (`sched_util_min` -1), which leaves a cgroup's `cpu.uclamp.min` as it applies to every

@@ -389,6 +389,13 @@ fn checked_ranges(ranges: &[PhysicalMemoryRange], alloc_size: u64) -> Option<()>
 /// its first byte, or `None` where a range has no file behind it or the host gives no address
 /// space, nothing left mapped.
 fn view(ranges: &[PhysicalMemoryRange], length: u64, read_only: bool) -> Option<u64> {
+    super::census::as_kind(super::census::Kind::Surface, || {
+        view_counted(ranges, length, read_only)
+    })
+}
+
+/// [`view`], its mappings counted as the census's surface views.
+fn view_counted(ranges: &[PhysicalMemoryRange], length: u64, read_only: bool) -> Option<u64> {
     let vm = LinuxVm::new();
     let at = vm.allocate_anywhere(length).ok()?;
     let mut offset = 0u64;

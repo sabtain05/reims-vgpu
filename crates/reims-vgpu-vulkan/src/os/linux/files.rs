@@ -26,6 +26,10 @@
 //! them, and splits a mapping where part of it is unmapped or protected apart, as the table cuts
 //! its runs, so the count follows every view, protect and unmap. Registrations map nothing.
 //!
+//! The table also counts its runs' mappings by the kind of view that made each
+//! ([`super::census`]): runs of several kinds the kernel holds as one mapping are counted as one
+//! of the first run's kind.
+//!
 //! The table is a leaf lock: nothing is called under it.
 
 use std::collections::BTreeMap;
@@ -37,6 +41,8 @@ use reims_vgpu_core::sync::Mutex;
 
 use crate::os::GuestRamFile;
 
+use super::census::Kind;
+
 /// The file behind a range: an open descriptor, and the file offset of the range's first byte.
 #[derive(Clone, Debug)]
 pub(crate) struct Backing {
@@ -46,13 +52,14 @@ pub(crate) struct Backing {
     pub(crate) offset: u64,
 }
 
-/// A run of the library's own mapping: its end, its file and the protection set on it
-/// (`PROT_*`).
+/// A run of the library's own mapping: its end, its file, the protection set on it (`PROT_*`)
+/// and the kind of view that made it.
 #[derive(Clone, Debug)]
 struct Run {
     end: u64,
     backing: Backing,
     prot: i32,
+    kind: Kind,
 }
 
 /// A registration: `first..end` shows `backing`, read and write, `count` times registered.
@@ -81,6 +88,8 @@ struct Table {
     runs: BTreeMap<u64, Run>,
     /// The pairs of neighbouring runs the kernel holds as one mapping ([`joined`]).
     joins: usize,
+    /// The runs of each kind, and the joins of a run of it to the run before (module docs).
+    kinds: [(usize, usize); Kind::COUNT],
 }
 
 /// The process's table.
@@ -88,6 +97,7 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     registered: Vec::new(),
     runs: BTreeMap::new(),
     joins: 0,
+    kinds: [(0, 0); Kind::COUNT],
 });
 
 /// Whether the kernel holds the run `a` from `a_first` and the run `b` from `b_first` as one
@@ -106,25 +116,36 @@ impl Table {
         self.runs.len() - self.joins
     }
 
-    /// How many of the runs on either side of `first..run.end` join a run there ([`joined`]).
-    fn joins_beside(&self, first: u64, run: &Run) -> usize {
+    /// The joins of the runs on either side of `first..run.end` to a run there ([`joined`]), each
+    /// as the kind of the later run of the pair, which it is counted for (module docs).
+    fn joins_beside(&self, first: u64, run: &Run) -> [Option<Kind>; 2] {
         let before = (self.runs.range(..first).next_back())
-            .is_some_and(|(&at, before)| joined(at, before, first, run));
+            .filter(|&(&at, before)| joined(at, before, first, run))
+            .map(|_| run.kind);
         let after = (self.runs.range(run.end..).next())
-            .is_some_and(|(&at, after)| joined(first, run, at, after));
-        usize::from(before) + usize::from(after)
+            .filter(|&(&at, after)| joined(first, run, at, after))
+            .map(|(_, after)| after.kind);
+        [before, after]
     }
 
     /// Adds a run over bytes no run holds, counting the neighbours it joins.
     fn insert(&mut self, first: u64, run: Run) {
-        self.joins += self.joins_beside(first, &run);
+        for kind in self.joins_beside(first, &run).into_iter().flatten() {
+            self.joins += 1;
+            self.kinds[kind.index()].1 += 1;
+        }
+        self.kinds[run.kind.index()].0 += 1;
         self.runs.insert(first, run);
     }
 
     /// Removes the run from `first`, uncounting the neighbours it joined.
     fn remove(&mut self, first: u64) -> Option<Run> {
         let run = self.runs.remove(&first)?;
-        self.joins -= self.joins_beside(first, &run);
+        for kind in self.joins_beside(first, &run).into_iter().flatten() {
+            self.joins -= 1;
+            self.kinds[kind.index()].1 -= 1;
+        }
+        self.kinds[run.kind.index()].0 -= 1;
         Some(run)
     }
 
@@ -166,11 +187,20 @@ impl Table {
         }
     }
 
-    /// `first..end` shows `backing` with protection `prot` from now on (`record`).
-    fn record(&mut self, first: u64, end: u64, backing: Backing, prot: i32) {
+    /// `first..end` shows `backing` with protection `prot` from now on, a view of `kind`
+    /// (`record`).
+    fn record(&mut self, first: u64, end: u64, backing: Backing, prot: i32, kind: Kind) {
         self.forget(first, end);
         if first < end {
-            self.insert(first, Run { end, backing, prot });
+            self.insert(
+                first,
+                Run {
+                    end,
+                    backing,
+                    prot,
+                    kind,
+                },
+            );
         }
     }
 
@@ -198,9 +228,18 @@ pub(crate) fn mappings() -> u64 {
     TABLE.lock().mappings().to_u64()
 }
 
-/// The kernel's mappings the table's runs in `first..end` take, as [`mappings`] counts them
-/// (tests: a range's count to set beside the kernel's).
-#[cfg(test)]
+/// The kernel's mappings the table's runs take, by the kind of view that made them, as
+/// [`mappings`] counts them (module docs): indexed by [`Kind::index`].
+pub(crate) fn census() -> [u64; Kind::COUNT] {
+    let table = TABLE.lock();
+    table
+        .kinds
+        .map(|(runs, joins)| runs.saturating_sub(joins).to_u64())
+}
+
+/// The kernel's mappings the table's runs that start in `first..end` take, as [`mappings`]
+/// counts them (a range's count to set beside the kernel's, and the census's of the unmaps that
+/// wait).
 pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     let table = TABLE.lock();
     let mut count = 0u64;
@@ -214,12 +253,12 @@ pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     count
 }
 
-/// `length` bytes from `first` show `backing` from now on, with protection `prot`: what of
-/// another run they cover goes.
-pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: i32) {
+/// `length` bytes from `first` show `backing` from now on, with protection `prot`, a view of
+/// `kind`: what of another run they cover goes.
+pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: i32, kind: Kind) {
     TABLE
         .lock()
-        .record(first, first.saturating_add(length), backing, prot);
+        .record(first, first.saturating_add(length), backing, prot, kind);
 }
 
 /// `length` bytes from `first` show no file from now on.
@@ -416,7 +455,13 @@ mod tests {
             offset,
         };
         let held = Registration::new(base, 0x10_000, backing(0x100_000));
-        record(base + 0x20_000, 0x2000, backing(0x5000), libc::PROT_READ);
+        record(
+            base + 0x20_000,
+            0x2000,
+            backing(0x5000),
+            libc::PROT_READ,
+            Kind::Other,
+        );
         assert_eq!(
             shape(&pieces(base + 0x1000, 0x2000).unwrap()),
             [(0, 0x2000, 0x101_000)]
@@ -457,8 +502,15 @@ mod tests {
             0x4000,
             backing(0x10_000),
             libc::PROT_READ | libc::PROT_WRITE,
+            Kind::Other,
         );
-        record(base + 0x1000, 0x1000, backing(0x90_000), libc::PROT_READ);
+        record(
+            base + 0x1000,
+            0x1000,
+            backing(0x90_000),
+            libc::PROT_READ,
+            Kind::Other,
+        );
         assert_eq!(
             shape(&pieces(base, 0x4000).unwrap()),
             [
@@ -519,14 +571,15 @@ mod tests {
             fd: Arc::clone(fd),
             offset,
         };
+        let other = Kind::Other;
         // Four pages of one file in order: one mapping.
         for i in 0..4 {
-            t.record(at(i), at(i + 1), b(&f, i * page), rw);
+            t.record(at(i), at(i + 1), b(&f, i * page), rw, other);
         }
         assert_eq!(t.mappings(), 1);
         // A page of the file out of order after them, then a page of another file: three.
-        t.record(at(4), at(5), b(&f, 0x9000), rw);
-        t.record(at(5), at(6), b(&g, 0xa000), rw);
+        t.record(at(4), at(5), b(&f, 0x9000), rw, other);
+        t.record(at(5), at(6), b(&g, 0xa000), rw, other);
         assert_eq!(t.mappings(), 3);
         // The second page read-only cuts the first mapping in three; read and write again, one.
         t.protect(at(1), at(2), libc::PROT_READ);
@@ -536,13 +589,56 @@ mod tests {
         // An unmap of the second page cuts it in two; the page mapped again as it was, one.
         t.forget(at(1), at(2));
         assert_eq!(t.mappings(), 4);
-        t.record(at(1), at(2), b(&f, page), rw);
+        t.record(at(1), at(2), b(&f, page), rw, other);
         assert_eq!(t.mappings(), 3);
         // Another page of the file over the third: the first mapping in three.
-        t.record(at(2), at(3), b(&f, 0x20_000), rw);
+        t.record(at(2), at(3), b(&f, 0x20_000), rw, other);
         assert_eq!(t.mappings(), 5);
         t.forget(base, at(6));
         assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
+    }
+
+    /// The mappings of each kind of view sum to the table's: runs of two kinds the kernel joins
+    /// are one mapping of the first one's kind, and a protect or an unmap that cuts a run keeps
+    /// its kind
+    #[test]
+    fn the_table_counts_each_kinds_mappings() {
+        let f = file();
+        let mut t = Table::default();
+        let base = 0x2000_0000;
+        let page = 0x1000;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let at = |i: u64| base + i * page;
+        let b = |offset| Backing {
+            fd: Arc::clone(&f),
+            offset,
+        };
+        let count = |t: &Table, kind: Kind| {
+            let (runs, joins) = t.kinds[kind.index()];
+            runs - joins
+        };
+        let sums = |t: &Table| {
+            let total: usize = Kind::ALL.iter().map(|&k| count(t, k)).sum();
+            assert_eq!(total, t.mappings());
+            (count(t, Kind::Task), count(t, Kind::Alias))
+        };
+        // Two pages of a task's view, then the file's next page in an alias: one mapping.
+        t.record(at(0), at(1), b(0), rw, Kind::Task);
+        t.record(at(1), at(2), b(page), rw, Kind::Task);
+        t.record(at(2), at(3), b(2 * page), rw, Kind::Alias);
+        assert_eq!(sums(&t), (1, 0));
+        // The alias's page read-only cuts it apart: one of each.
+        t.protect(at(2), at(3), libc::PROT_READ);
+        assert_eq!(sums(&t), (1, 1));
+        // An unmap of the task's first page leaves its second.
+        t.forget(at(0), at(1));
+        assert_eq!(sums(&t), (1, 1));
+        // Read and write again, it joins the task's page before it: one mapping, the task's.
+        t.protect(at(2), at(3), rw);
+        assert_eq!(sums(&t), (1, 0));
+        t.forget(base, at(3));
+        assert_eq!(sums(&t), (0, 0));
+        assert_eq!(t.kinds, [(0, 0); Kind::COUNT]);
     }
 
     /// The same bytes registered again over the same file and offset are counted: they stay

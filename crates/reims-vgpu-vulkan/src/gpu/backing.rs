@@ -38,7 +38,11 @@
 //!   command that may write through the object dies where it is encoded
 //!   (`crate::gpu::writes::kept_write`).
 //! - **Detach** marks the object detached; its `contents` and its GPU address stay, as Metal's do
-//!   (measured: `contents` stays the alias of the last replace, still over its pages). A
+//!   (measured: `contents` stays the alias of the last replace, still over its pages). On Linux
+//!   the alias's views are parked meanwhile, one kernel mapping in place of one per run of the
+//!   guest's pages, while no import holds them and nothing read through `contents`, and made
+//!   again before either ([`Parking`]). A heap the guest released, which core's cover buffer
+//!   alone holds, is detached as well (`crate::gpu::resource`'s module docs). A
 //!   submission of a command buffer that uses it fails while it is detached, as do those of
 //!   command buffers made before it was released detached ([`submission_check`],
 //!   `crate::gpu::command`'s docs). A command that names the object, encoded before a replace,
@@ -401,20 +405,39 @@ impl Backing {
         DETACHED.lock().detached(id);
         self.seen.forget_uses();
         self.seen.zero();
+        // The alias it keeps for `contents` alone may be parked from now on.
+        let last = self.alias.lock().last.clone();
+        if let Some(alias) = last {
+            alias.detached();
+        }
     }
 
     /// Where the object's `contents` stays while it is detached: the first byte of the alias of
     /// its last replace or of the ranges a heap was made over, or of the memory a no-copy buffer
     /// was made over, which it had when it was detached ([`Backing::detach`]); `None` for one
     /// attached, whose runtime object answers.
+    ///
+    /// The bytes there are read: a parked alias's views are mapped again first, and stay
+    /// ([`Parking`]).
     pub(crate) fn kept_contents(&self) -> Option<NonNull<u8>> {
-        let aliased = self.alias.lock();
-        let kept = match (&aliased.last, &aliased.own) {
-            (Some(alias), _) => Some(alias.at),
-            (None, Some(own)) => Some(own.at),
-            (None, None) => None,
+        if !self.seen.zeroed() {
+            return None;
+        }
+        let (alias, own) = {
+            let aliased = self.alias.lock();
+            (aliased.last.clone(), aliased.own.as_ref().map(|own| own.at))
         };
-        self.seen.zeroed().then_some(kept).flatten()
+        match alias {
+            Some(alias) => Some(alias.read("contents")),
+            None => own,
+        }
+    }
+
+    /// Whether the object's `contents` stays where it was while it is detached
+    /// ([`Backing::kept_contents`]), its bytes unread.
+    pub(crate) fn keeps_contents(&self) -> bool {
+        let aliased = self.alias.lock();
+        self.seen.zeroed() && (aliased.last.is_some() || aliased.own.is_some())
     }
 
     /// The object, a heap, was made over `alias`, the alias of `ranges` of the guest's pages
@@ -835,6 +858,49 @@ pub(crate) struct Alias {
     /// Whether the runtime imports it through a writable twin of read-only pages, as its last
     /// import found ([`Alias::into_runtime`]).
     kept: AtomicBool,
+    /// Whether its views are parked, and what decides it ([`Parking`]).
+    parking: Mutex<Parking>,
+}
+
+/// When an alias's views of the guest's pages are parked (`crate::os::park`): while the object it
+/// was last given is detached and keeps it only for its `contents` ([`Backing::kept_contents`]),
+/// no import of the runtime's lies over it ([`Alias::into_runtime`]), and no `contents` was
+/// answered over it since the detach. Such an alias is over pages the guest has given up, and may
+/// give another object; the guest keeps many objects detached, and on Linux each run of their
+/// aliases' pages is a kernel mapping, which they would hold until each is replaced or released
+/// (measured on an RTX 5080 host, an x86-64 macOS 26.6.1 guest of 16 GiB at 3840x2400, 2026-10-18:
+/// 264 detached objects kept 285 MiB of aliases in 120,000 mappings of 4 KiB pieces once five apps
+/// had been opened and quit, where 72 kept 27 MiB in 7,500 after the boot). Parked, the range
+/// stays the alias's, so `contents` keeps its address; an import of it, or an answer of
+/// `contents` over it, maps its views again first, so the bytes read there are the pages' as
+/// they are then, as Metal's alias of a detached object reads them, and from an answer of
+/// `contents` on its views stay until the alias goes. On macOS nothing is parked.
+#[derive(Debug, Default)]
+struct Parking {
+    /// The runtime's imports of it whose keep-alive has not gone.
+    imports: usize,
+    /// Whether the object it was last given is detached.
+    detached: bool,
+    /// Whether `contents` was answered over it while the object was detached.
+    read: bool,
+    /// Its views, taken away while parked.
+    parked: Option<crate::os::Parked>,
+}
+
+/// An alias the runtime imports, held in the import's keep-alive: its drop, once the runtime
+/// freed the import, may park the alias ([`Parking`]).
+struct Imported(Arc<Alias>);
+
+impl Drop for Imported {
+    fn drop(&mut self) {
+        // The keep-alive's is the last reference where the object went too: the alias goes now.
+        let last = Arc::strong_count(&self.0) == 1;
+        let mut parking = self.0.parking.lock();
+        parking.imports = parking.imports.saturating_sub(1);
+        if !last {
+            self.0.park_if_idle(&mut parking);
+        }
+    }
 }
 
 // SAFETY: an `Alias` is an address range this platform owns; nothing reads through it here, and
@@ -856,12 +922,54 @@ impl Alias {
     /// reach the pages, where Metal drops them ([`Alias::writes_kept`]).
     pub(crate) fn into_runtime(self: Arc<Self>, site: ImportSite) -> (NonNull<u8>, rt::KeepAlive) {
         let first = self.at;
+        {
+            let mut parking = self.parking.lock();
+            self.mapped("an import of an alias", &mut parking);
+            parking.imports += 1;
+        }
         let view = crate::os::import_view(first, self.length);
         let imported = view.at();
         self.kept.store(view.writes_kept(), Ordering::Release);
         let (_, twin) = view.release(first, None);
         let traced = ImportTrace::new(site, first, self.length, imported);
-        (imported, keep_alive((twin, self, traced)))
+        (imported, keep_alive((twin, Imported(self), traced)))
+    }
+
+    /// The object the alias was last given is detached, and keeps it for its `contents` alone
+    /// ([`Backing::detach`]): parked where nothing else holds its views ([`Parking`]).
+    fn detached(&self) {
+        let mut parking = self.parking.lock();
+        parking.detached = true;
+        self.park_if_idle(&mut parking);
+    }
+
+    /// The alias's first byte, which the `contents` of the detached object it was last given
+    /// answers ([`Backing::kept_contents`]): its views mapped again where they were parked, at
+    /// `sel`, and kept from now on.
+    fn read(&self, sel: &'static str) -> NonNull<u8> {
+        let mut parking = self.parking.lock();
+        parking.read = true;
+        self.mapped(sel, &mut parking);
+        self.at
+    }
+
+    /// Parks the alias's views where nothing holds them ([`Parking`]).
+    fn park_if_idle(&self, parking: &mut Parking) {
+        let idle = parking.detached && !parking.read && parking.imports == 0;
+        if idle && parking.parked.is_none() {
+            parking.parked = crate::os::park(HostPtr::from_ptr(self.at.as_ptr()), self.length);
+        }
+    }
+
+    /// Maps the alias's views again where they are parked, for `sel`; where the host refuses
+    /// that, the process ends at `sel`, as Metal's alias stays over the pages
+    /// ([`refused_by_host`]).
+    fn mapped(&self, sel: &'static str, parking: &mut Parking) {
+        if let Some(parked) = parking.parked.take()
+            && let Err(kr) = crate::os::unpark(parked)
+        {
+            refused_by_host(sel, "the views of a parked alias", self.length, kr);
+        }
     }
 
     /// Whether the runtime imports the alias through a writable twin of read-only pages, whose
@@ -1078,6 +1186,16 @@ pub(crate) fn gather(
     size: u64,
     read_only: bool,
 ) -> Option<Alias> {
+    crate::os::as_alias(|| gather_counted(sel, ranges, size, read_only))
+}
+
+/// [`gather`], its views counted as aliases' by Linux's census of the views' mappings.
+fn gather_counted(
+    sel: &'static str,
+    ranges: &[ResourceAddressRange],
+    size: u64,
+    read_only: bool,
+) -> Option<Alias> {
     let vm = OsVm::new();
     let page = vm.page_size();
     let length = size.checked_next_multiple_of(page)?;
@@ -1104,6 +1222,7 @@ pub(crate) fn gather(
         at: NonNull::new(at.as_ptr::<u8>())?,
         length,
         kept: AtomicBool::new(false),
+        parking: Mutex::default(),
     };
     for run in runs {
         let source = HostPtr::from_addr(usize::try_from(run.source).ok()?);
@@ -1462,6 +1581,71 @@ mod tests {
         assert_eq!(seen, 0x6d, "the alias's write shows in the guest's page");
         drop(alias);
         assert!(OsVm::new().deallocate(guest, 4 * PAGE).is_success());
+    }
+
+    /// A detached object's alias is parked once no import of the runtime's holds it, and not
+    /// before: on Linux its views give way to one mapping of no access, on macOS they stay. Its
+    /// `contents` maps them again, over the guest's pages as they are then, and from then on they
+    /// stay, imported or not
+    #[test]
+    fn a_detached_objects_alias_parks_once_no_import_holds_it() {
+        let vm = OsVm::new();
+        let guest = pages(3, 0x5a);
+        let ranges = [
+            range(address(guest) + 2 * PAGE, PAGE),
+            range(address(guest), PAGE),
+        ];
+        let alias = Arc::new(gather(REPLACE, &ranges, 2 * PAGE, false).unwrap());
+        let at = HostPtr::from_ptr(alias.first().as_ptr());
+        let (_, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
+        alias.detached();
+        assert!(vm.readable(at, 2 * PAGE), "an import holds it");
+        drop(keep);
+        let parks = cfg!(target_os = "linux");
+        assert_eq!(!vm.readable(at, 2 * PAGE), parks, "parked on Linux");
+        write(guest, 2 * PAGE + 3, 0x6b);
+        let first = alias.read(REPLACE);
+        assert_eq!(first, alias.first(), "contents keeps its address");
+        assert_eq!(
+            (read(first, 3), read(first, PAGE)),
+            (0x6b, 0x5a),
+            "the guest's pages as they are now"
+        );
+        let (_, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
+        drop(keep);
+        assert!(vm.readable(at, 2 * PAGE), "read: its views stay");
+        drop(alias);
+        assert!(vm.deallocate(guest, 3 * PAGE).is_success());
+    }
+
+    /// An alias whose object is detached, parked, and imported again maps its views first; one
+    /// whose object is attached, or that its import's keep-alive held last, is never parked
+    #[test]
+    fn an_alias_is_parked_only_while_detached_and_unimported() {
+        let vm = OsVm::new();
+        let parks = cfg!(target_os = "linux");
+        let guest = pages(2, 0x3c);
+        let ranges = [
+            range(address(guest) + PAGE, PAGE),
+            range(address(guest), PAGE),
+        ];
+        let alias = Arc::new(gather(REPLACE, &ranges, 2 * PAGE, false).unwrap());
+        let at = HostPtr::from_ptr(alias.first().as_ptr());
+        let (_, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
+        drop(keep);
+        assert!(vm.readable(at, 2 * PAGE), "attached");
+        alias.detached();
+        assert_eq!(!vm.readable(at, 2 * PAGE), parks, "detached, unimported");
+        let (_, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
+        assert!(vm.readable(at, 2 * PAGE), "imported again");
+        assert_eq!(read(alias.first(), PAGE), 0x3c);
+        drop(keep);
+        assert_eq!(!vm.readable(at, 2 * PAGE), parks, "parked again");
+        // The keep-alive's reference is the last: the alias goes, unparked.
+        let (_, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
+        drop(alias);
+        drop(keep);
+        assert!(vm.deallocate(guest, 2 * PAGE).is_success());
     }
 
     /// A NULL or unmapped range, one with a page mapped without access, within the size or past

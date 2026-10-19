@@ -388,10 +388,12 @@ pub fn create<T>(
 ///     here makes;
 ///   - `MoltenVkArgumentBuffersUnread` and the notes `BeyondMeasuredDeviation` and
 ///     `FunctionStorageAssumed`: a driver release, a MoltenVK configuration or a device's private
-///     memory the runtime has not measured, where this host's are measured. A device whose
-///     driver, GPU and release the runtime has not measured takes no driver fact measured
-///     elsewhere, only the exact path, and says so once as it is made in an informational message
-///     (`metal2vulkan-unmeasured-driver`), which is relayed ([`relay`]), no degradation. Function
+///     memory the runtime has not measured, where this host's are measured. A device decides each
+///     driver fact on itself (checked on the device, a listed driver, or a path a device loss
+///     turned off), and takes the exact path for one it cannot decide; it says how it decided each
+///     in an informational message as it is made (`metal2vulkan-feature-status`), and again once
+///     its background checks settle (`metal2vulkan-feature-status-settled`), each relayed
+///     ([`relay`]), no degradation. Function
 ///     storage has no exact path: on a device whose private memory it has not measured, the
 ///     runtime takes its floor, 16 KiB a thread, below every size a measured device failed at,
 ///     and runs a stage within it unnoted. A vertex or fragment function past the floor, up to
@@ -1611,9 +1613,9 @@ pub(crate) static RELAYED: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
 /// (`metal2vulkan-degrade-`), its pipeline-creation log's (`metal2vulkan-pipeline-creation`) and
 /// its other diagnostics' (`metal2vulkan-late-reservation`, `metal2vulkan-host-import-freed`, the
 /// shader cache's `metal2vulkan-shader-cache-evicted` and
-/// `metal2vulkan-shader-cache-write-failed`, each said once per device, and
-/// `metal2vulkan-unmeasured-driver`, said as a device whose driver, GPU and release the runtime
-/// has not measured is made).
+/// `metal2vulkan-shader-cache-write-failed`, each said once per device, and a device's feature
+/// status, `metal2vulkan-feature-status` as it is made and `metal2vulkan-feature-status-settled`
+/// once its background checks settle).
 const RUNTIME_MESSAGES: &str = "metal2vulkan-";
 
 /// Writes `message`, which the runtime gave the sink, on stderr ([`relay_to`]).

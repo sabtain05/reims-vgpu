@@ -1405,7 +1405,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         crate::gpu::icb::encoder_made();
         self.protected_creation("computeCommandEncoder");
         let raw = encoding("computeCommandEncoder", Policy::Dies, || {
-            self.raw.compute_command_encoder()
+            self.raw.compute_command_encoder().map(Box::new)
         })?;
         metal_space::first_use(FirstUse::ComputeEncoder);
         Ok(Some(predication::encoder(raw, self)))
@@ -1571,6 +1571,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let raw = encoding("computeCommandEncoderWithDescriptor:", Policy::Dies, || {
             self.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
+                .map(Box::new)
         })?;
         metal_space::first_use(FirstUse::ComputeEncoder);
         Ok(Some(predication::encoder(raw, self)))

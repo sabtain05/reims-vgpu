@@ -279,14 +279,19 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// OS's Metal level ([`crate::os::METAL_LEVEL`]: on Linux macOS 26.7, the contract machine's, where
 /// the runtime's default off macOS is its newest measured release), the shader cache in
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
-/// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
-/// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
-/// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
-/// names ([`exact_policy`]), and the degradations the
-/// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
-/// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
-/// kinds announced at every occurrence ([`announced_each`]). One set,
-/// so the runtime keeps one device per physical device across `open_device` and every other open.
+/// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], the device checks'
+/// answers beside it ([`DEVICE_CHECKS`], waited for at the making only in the unit tests:
+/// [`DEVICE_CHECKS_WAIT`]), a command buffer's GPU times answered from the host's clock
+/// (`gpu_times_from_host`), the runtime's device policy, its fast native forms but its exact
+/// completion and heap textures and those `REIMS_VGPU_EXACT` names ([`exact_policy`]), and the
+/// degradations the runtime announces sent to the answer layer ([`crate::answer::notice`]), where
+/// those that reach what the guest sees are counted, and die in strict mode
+/// ([`crate::answer::strict`]), with the kinds announced at every occurrence ([`announced_each`]),
+/// and every render encoder encoded at the guest's call, with no resolver thread
+/// (`encode_at_the_call`): in a macOS guest the runtime took most captured encoders back to the
+/// call (on an Iris Xe, 12.9 of the 13.9 a frame, measured 2026-10-19), where the resolver's work
+/// comes back to the guest's thread with its log's cost on top. One set, so the runtime keeps one
+/// device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
@@ -335,10 +340,13 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             }
         }
         if let Some(home) = std::env::var_os("HOME") {
-            options.shader_cache =
-                rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
+            let cache = PathBuf::from(home).join(SHADER_CACHE);
+            options.device_checks.directory = Some(cache.join(DEVICE_CHECKS));
+            options.shader_cache = rt::ShaderCacheOptions::in_directory(cache);
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
+        options.device_checks.wait = DEVICE_CHECKS_WAIT;
+        options.encode_at_the_call = true;
         options
     });
     &OPTIONS
@@ -479,6 +487,25 @@ const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 /// library's hosts share.
 #[cfg(test)]
 const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan-tests";
+
+/// The directory under [`SHADER_CACHE`] that keeps what each device's checks of its driver found,
+/// one file per setup (driver, GPU, release, OS build and the runtime's build), which every
+/// process of the library shares (the runtime's `DeviceChecksOptions::directory`), and the
+/// driver paths a device loss turned off on that setup. Removing [`SHADER_CACHE`] removes it
+/// too. The shader cache's sweep reads only its own `v1` beside it.
+const DEVICE_CHECKS: &str = "device-checks";
+
+/// Whether a device's making waits for every check of its driver: not for a host's, whose checks
+/// of a setup not yet in [`DEVICE_CHECKS`] settle on the runtime's own thread after the making,
+/// the exact paths taken until they do (on an RTX 5080 Laptop GPU, measured by the runtime:
+/// +111 ms at the making and about 1 s on that thread, once per setup and runtime build).
+#[cfg(not(test))]
+const DEVICE_CHECKS_WAIT: bool = false;
+
+/// The unit tests' devices wait for every check as they are made, so a test process takes the
+/// same paths from its first device on, whether or not its setup is in [`DEVICE_CHECKS`] yet.
+#[cfg(test)]
+const DEVICE_CHECKS_WAIT: bool = true;
 
 /// The runtime's registry ID of its system default device, read once: `None` where it has none.
 pub(crate) fn default_device_registry_id() -> Option<u64> {

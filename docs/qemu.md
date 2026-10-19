@@ -546,14 +546,29 @@ isolated task's CPU, and the Metal lines it logs, are QEMU's.
 ### Linux hosts: `vm.max_map_count`
 
 On Linux the library's views of guest memory take a kernel mapping for each
-run of guest pages. An x86-64 guest's GPU memory comes in scattered 16 KiB
-pieces, so a view takes about 64 mappings per MiB. Measured on an RTX 5080
-Laptop GPU host (CachyOS, whose `vm.max_map_count` is 1,048,576) with a
-12 GiB macOS 26.6.1 guest on 2026-10-10:
+run of guest pages. An x86-64 guest's GPU memory comes in scattered 16 KiB or
+4 KiB pieces, so a view takes 64 to 256 mappings per MiB. Measured on an
+RTX 5080 Laptop GPU host (CachyOS, whose `vm.max_map_count` is 1,048,576)
+with a 12 GiB macOS 26.6.1 guest on 2026-10-10:
 - 2.2k to 3.3k guest-memory mappings at an idle desktop, and 22k to 29k
   with Safari and Maps open;
 - back to the idle count after they quit, in each of three rounds;
 - 1.7k to 4.6k other mappings in the process.
+
+Measured on the same host with a 16 GiB macOS 26.6.1 guest at 3840x2400 on
+2026-10-18, opening and quitting FaceTime, Font Book, Freeform, Home and
+Journal twice, its views in 4 KiB pieces:
+- 23k to 26k guest-memory mappings at the desktop a minute after the boot,
+  134k to 135k after the first round, and as many after the second: the
+  views of detached objects' aliases, and of heaps the guest had released,
+  which the cover buffers core keeps hold, never went;
+- with the detached objects' views parked, 42k a minute after the boot and
+  93k after each round;
+- over 13 other apps (Chess to Photo Booth), 252k, 237k of them under the 421
+  released heaps (`crates/reims-vgpu-vulkan/src/gpu/resource.rs`, "A heap
+  core let go of");
+- with those heaps detached too, 35k a minute after the boot, then 13.8k to
+  14.3k after each of the 13 apps and at the idle desktop after them.
 
 The views stop 16,384 mappings short of `vm.max_map_count`, and a view past
 that is refused. Past the limit itself the kernel refuses QEMU's and the

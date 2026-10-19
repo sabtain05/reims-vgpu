@@ -35,6 +35,13 @@
 //! gives. One refused for want of memory or address space is `KERN_NO_SPACE`, as Mach's is. A
 //! file the kernel gives none of for the library's memory ([`memfd`]) ends the process too,
 //! naming the open-file limit.
+//!
+//! **Parked views.** An alias of the guest's pages that a detached object keeps only for its
+//! `contents`, and that the runtime no longer imports, is parked ([`park`]): its views give way to
+//! one mapping of no access over the same range, so it holds one mapping in place of one per run
+//! of the guest's pages, and the range stays the alias's. [`unpark`] maps the same files at the
+//! same offsets and protections again, so a read there shows the pages as they are then, as the
+//! views did (`crate::gpu::backing`'s `Parking`).
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
@@ -44,6 +51,7 @@ use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
 use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 
 use super::budget;
+use super::census::{self, Kind};
 use super::files::{self, Backing};
 
 /// `KERN_INVALID_ADDRESS`.
@@ -212,7 +220,8 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     let backing = Backing { fd, offset: 0 };
     let prot = libc::PROT_READ | libc::PROT_WRITE;
     let at = file(None, length, &backing, prot)?;
-    files::record(at, length, backing, prot);
+    files::record(at, length, backing, prot, Kind::Range);
+    census::made(Kind::Range);
     Ok(HostAddr::from_addr(at.to_usize()))
 }
 
@@ -241,6 +250,7 @@ impl OwnMemory {
         };
         let first = file(None, length, &backing, libc::PROT_READ | libc::PROT_WRITE).ok()?;
         budget::own_hold(1, true);
+        census::made(Kind::StandIn);
         Some(OwnMemory {
             first,
             length,
@@ -261,6 +271,7 @@ impl Drop for OwnMemory {
         // SAFETY: the mapping this made, which nothing uses once its holder lets go of it.
         let _ = unsafe { libc::munmap(ptr(self.first), self.length.to_usize()) };
         budget::own_hold(1, false);
+        census::changed();
     }
 }
 
@@ -370,6 +381,95 @@ fn put_back(at: u64, length: u64) {
     }
 }
 
+/// An alias's views taken away while nothing reads them or imports them ([`park`]): its range,
+/// and the file, offset and protection of each piece of it, which [`unpark`] maps again.
+#[derive(Debug)]
+pub(crate) struct Parked {
+    first: u64,
+    length: u64,
+    pieces: Vec<files::Piece>,
+}
+
+impl Drop for Parked {
+    /// The alias is no longer parked: mapped again ([`unpark`]), or gone with its range.
+    fn drop(&mut self) {
+        census::parked(false);
+    }
+}
+
+/// Parks the views of the `len` bytes at `at`, a range of the platform's own whose every byte a
+/// view or a file of its own shows (an alias, `crate::gpu::backing::gather`): one mapping of no
+/// access in their place, the range kept so nothing else is mapped there (module docs). `None`,
+/// with nothing changed, where a byte has no file behind it, or the kernel refuses the map, which
+/// is logged; the views stay then.
+pub(crate) fn park(at: HostAddr, len: u64) -> Option<Parked> {
+    let (first, length) = pages(at, len)?;
+    if length == 0 {
+        return None;
+    }
+    let pieces = files::pieces(first, length)?;
+    // SAFETY: the alias's own range, which nothing reads or imports while it is parked (module
+    // docs); the map replaces it whole, at its address.
+    let mapped = unsafe {
+        libc::mmap(
+            ptr(first),
+            length.to_usize(),
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        log::error!(
+            target: "reims_vgpu_vulkan::os",
+            "an alias of {length:#x} bytes at {first:#x} was not parked: {}; its views stay",
+            std::io::Error::last_os_error()
+        );
+        put_back(first, length);
+        return None;
+    }
+    files::forget(first, length);
+    census::parked(true);
+    Some(Parked {
+        first,
+        length,
+        pieces,
+    })
+}
+
+/// Maps a parked alias's views again ([`park`]): each piece's file at its offset and protection,
+/// over its range, as before it was parked. Where the kernel refuses a piece, its answer, with the
+/// pieces mapped before it left out of the backing table, for the caller to end the process at.
+/// A view past the budget of mappings ends the process first ([`super::budget`]).
+pub(crate) fn unpark(mut parked: Parked) -> Result<(), KernReturn> {
+    let (first, length) = (parked.first, parked.length);
+    let pieces = std::mem::take(&mut parked.pieces);
+    budget::admit(
+        mappings_added(&pieces),
+        "a parked alias's views, made again",
+    );
+    for piece in &pieces {
+        file(
+            Some(first + piece.at),
+            piece.length,
+            &piece.backing,
+            piece.prot,
+        )?;
+    }
+    for piece in pieces {
+        let at = first + piece.at;
+        files::record(at, piece.length, piece.backing, piece.prot, Kind::Alias);
+    }
+    log::debug!(
+        target: "reims_vgpu_vulkan::os",
+        "the parked alias of {length:#x} bytes at {first:#x} is mapped again"
+    );
+    drop(parked);
+    census::made(Kind::Alias);
+    Ok(())
+}
+
 /// The most mappings a view of `pieces` adds: one for each run of them the kernel holds as one
 /// (each piece following the one before in the same file at the same protection), and one more
 /// where the view cuts a run of its target in two.
@@ -473,6 +573,7 @@ impl HostVm for LinuxVm {
         }
         anonymous(Some(first), length, "allocate_fixed_overwrite")?;
         files::forget(first, length);
+        census::changed();
         Ok(())
     }
 
@@ -499,6 +600,7 @@ impl HostVm for LinuxVm {
             return Err(INVALID_ADDRESS);
         };
         budget::admit(mappings_added(&pieces), "a view of guest pages");
+        let kind = census::view_kind(target);
         for (done, piece) in pieces.iter().enumerate() {
             if let Err(kr) = file(
                 Some(target + piece.at),
@@ -513,8 +615,10 @@ impl HostVm for LinuxVm {
             }
         }
         for piece in pieces {
-            files::record(target + piece.at, piece.length, piece.backing, piece.prot);
+            let at = target + piece.at;
+            files::record(at, piece.length, piece.backing, piece.prot, kind);
         }
+        census::made(kind);
         Ok(dst)
     }
 
@@ -531,6 +635,7 @@ impl HostVm for LinuxVm {
             return Err(refused("protect_max", true));
         }
         files::protect(first, length, bits);
+        census::protected(first, length, bits);
         Ok(())
     }
 
@@ -551,10 +656,12 @@ impl HostVm for LinuxVm {
             return INVALID_ARGUMENT;
         }
         files::forget(first, length);
+        census::unmapped(first, length);
         // SAFETY: the range is one core allocated and no longer uses (its owner's drop).
         if unsafe { libc::munmap(ptr(first), length.to_usize()) } != 0 {
             return refused("deallocate", true);
         }
+        census::changed();
         KernReturn::SUCCESS
     }
 }
@@ -674,6 +781,56 @@ pub(crate) mod tests {
         assert_eq!(both(), (4, 4), "its third page unmapped");
         assert!(v.deallocate(at, 8 * p).is_success());
         assert!(v.deallocate(src, 8 * p).is_success());
+    }
+
+    /// A parked alias holds one mapping of no access over its range, which no file shows; mapped
+    /// again, it shows the same pages, as they are then, with the protections it had, in as many
+    /// mappings as before
+    #[test]
+    fn a_parked_alias_is_one_mapping_and_comes_back_as_it_was() {
+        let v = vm();
+        let p = page();
+        let src = allocate_aliasable(4 * p).unwrap();
+        // The alias is the middle four pages of six, read and write zeros on either side.
+        let reserved = v.allocate_anywhere(6 * p).unwrap();
+        let at = reserved.wrapping_add(p);
+        // Pages 3, 1, 2 and 0: three runs of the file, the last read-only.
+        for (to, from) in [(0, 3), (1, 1), (2, 2), (3, 0)] {
+            v.remap_shared_overwrite(at.wrapping_add(to * p), src.wrapping_add(from * p), p)
+                .unwrap();
+        }
+        v.protect_max(at.wrapping_add(3 * p), p, VmProt::READ)
+            .unwrap();
+        let (first, end) = (at.addr().to_u64(), at.addr().to_u64() + 4 * p);
+        let both = || {
+            (
+                kernel_mappings(first, end),
+                files::mappings_between(first, end),
+            )
+        };
+        assert_eq!(both(), (3, 3));
+        let parked = park(at, 4 * p).unwrap();
+        assert_eq!(both(), (1, 0), "one mapping, of no file");
+        assert!(files::pieces(first, p).is_none());
+        assert!(!v.readable(at, p), "no access");
+        write(src, 3 * p + 1, 0x7e);
+        unpark(parked).unwrap();
+        assert_eq!(both(), (3, 3));
+        assert_eq!(read(at, 1), 0x7e, "the page as it is now");
+        assert!(writable(at, 3 * p), "read and write");
+        assert!(!writable(at.wrapping_add(3 * p), p), "read-only");
+        assert!(v.deallocate(reserved, 6 * p).is_success());
+        assert!(v.deallocate(src, 4 * p).is_success());
+    }
+
+    /// A range a byte of which no file shows is not parked
+    #[test]
+    fn a_range_of_no_file_is_not_parked() {
+        let v = vm();
+        let at = v.allocate_anywhere(2 * page()).unwrap();
+        assert!(park(at, 2 * page()).is_none());
+        assert!(v.readable(at, 2 * page()));
+        assert!(v.deallocate(at, 2 * page()).is_success());
     }
 
     /// The host page is 4 KiB on x86-64 Linux, its shift 12
@@ -816,7 +973,7 @@ pub(crate) mod tests {
             offset: 0,
         };
         file(Some(first), p, &ones, rw).unwrap();
-        files::record(first, p, ones, rw);
+        files::record(first, p, ones, rw, Kind::Other);
         let twos = Backing {
             fd: page_file(0x22, true),
             offset: 0,

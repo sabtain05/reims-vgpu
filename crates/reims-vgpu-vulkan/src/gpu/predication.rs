@@ -1580,6 +1580,7 @@ impl Unit {
         let mut fresh = made(sel, || {
             cb.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
+                .map(Box::new)
         });
         cb.made_encoder(false);
         made(sel, || {
@@ -1595,8 +1596,9 @@ impl Unit {
 /// predication.
 #[derive(Debug)]
 pub struct PredicatedEncoder {
-    /// The runtime's encoder.
-    pub encoder: EncoderObject<rt::ComputeCommandEncoder>,
+    /// The runtime's encoder, boxed as the runtime answers it: it is over 1 KiB, which each move
+    /// of the encoder, from the runtime's answer to its end, would copy.
+    pub encoder: EncoderObject<Box<rt::ComputeCommandEncoder>>,
     predication: Arc<Predication>,
     /// Its command buffer, held weakly as the encoder holds it: once the runtime's encoder ended,
     /// an encoder that outlives its command buffer holds no slot of its queue.
@@ -1606,8 +1608,8 @@ pub struct PredicatedEncoder {
 }
 
 impl Deref for PredicatedEncoder {
-    type Target = EncoderObject<rt::ComputeCommandEncoder>;
-    fn deref(&self) -> &EncoderObject<rt::ComputeCommandEncoder> {
+    type Target = EncoderObject<Box<rt::ComputeCommandEncoder>>;
+    fn deref(&self) -> &EncoderObject<Box<rt::ComputeCommandEncoder>> {
         &self.encoder
     }
 }
@@ -1628,7 +1630,7 @@ impl Drop for PredicatedEncoder {
 /// A compute encoder of `command_buffer`, `raw`: its bindings start empty, and a loop's body
 /// open across encoders holds the change.
 pub fn encoder(
-    raw: rt::ComputeCommandEncoder,
+    raw: Box<rt::ComputeCommandEncoder>,
     command_buffer: &VulkanCommandBuffer,
 ) -> VulkanComputeEncoder {
     let predication = Arc::clone(&command_buffer.predication);

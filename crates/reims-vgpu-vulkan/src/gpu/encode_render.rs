@@ -346,8 +346,9 @@ fn half_output_apart(sel: &'static str, (index, format): (usize, PixelFormat)) {
 /// for.
 #[derive(Debug)]
 pub struct RenderEncoderObject {
-    /// The runtime's encoder, until it ends.
-    pub encoder: EncoderObject<rt::RenderCommandEncoder>,
+    /// The runtime's encoder, until it ends, boxed as the runtime answers it: it is some 6 KiB,
+    /// which each move of the encoder, from the runtime's answer to its end, would copy.
+    pub encoder: EncoderObject<Box<rt::RenderCommandEncoder>>,
     /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
     nil_pipeline: Mutex<bool>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
@@ -1873,7 +1874,12 @@ fn make(
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let made = without_unused_resolves(&d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&made)) {
+    match plain_at(sel, || {
+        command_buffer
+            .raw
+            .render_command_encoder(&made)
+            .map(Box::new)
+    }) {
         Ok(raw) => {
             command_buffer.tiler_work(crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(
@@ -1952,7 +1958,7 @@ fn make(
 /// rasterizes nothing empties its scissor rectangle.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
-    raw: rt::RenderCommandEncoder,
+    raw: Box<rt::RenderCommandEncoder>,
     (d, made, dropped): (
         &rt::RenderPassDescriptor,
         rt::RenderPassDescriptor,
@@ -3088,9 +3094,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
-                let ended = self
-                    .encoder
-                    .end(sel, rt::RenderCommandEncoder::end_encoding);
+                let ended = self.encoder.end(sel, |e| e.end_encoding());
                 if ended.is_ok()
                     && self.hung.load(Ordering::SeqCst)
                     && let Some(cb) = self.encoder.command_buffer()
@@ -7092,7 +7096,7 @@ pub(crate) mod tests {
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let desc = pass.descriptor();
         let made = without_unused_resolves(&desc);
-        let raw = cb.raw.render_command_encoder(&made).unwrap();
+        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();

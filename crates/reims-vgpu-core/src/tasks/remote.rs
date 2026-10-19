@@ -32,7 +32,9 @@
 //! - **FIFO events**: a FIFO's event crosses once per stamp index (`setFifoEvent:forIndex:`)
 //!   before the command that needs it, its handle carried by the message. A FIFO's deletion
 //!   clears its index after the message (`forwards_then_clears_the_stamp_bit`).
-//! - **Exec** blocks the FIFO thread until the service's reply (or the death); only a reply of 1
+//! - **Exec** blocks the FIFO thread until the service's reply (or the death), and the service
+//!   runs the exec's job on that thread, in its turn after every message sent before it
+//!   (`an_exec_is_taken_on_the_fifo_thread_after_the_messages_before_it`); only a reply of 1
 //!   advances the FIFO's event value, a reply of neither 1 nor 4 completes at once, and a 1
 //!   completes later through the service's `completeAsyncTokenID:`
 //!   (`success_advances_the_counter_and_completes_through_the_service`).
@@ -366,7 +368,8 @@ impl<P: Platform> RemoteTask<P> {
     }
 
     /// Runs one exec: shares the FIFO's event, sends the command and blocks the FIFO thread until
-    /// the service's reply (or the crash). A reply of 1 advances the FIFO's event value; the
+    /// the service's reply (or the crash). The service runs the exec's job on the FIFO thread
+    /// itself ([`ServiceLink::send_here`], [`execs_here`]). A reply of 1 advances the FIFO's event value; the
     /// kernel task's shared-texture backings the reply lists are invalidated for the guest; the
     /// completion then comes from the service (1), came from the crash (4), or is made here.
     #[allow(clippy::too_many_arguments)] // the exec's parts, as the service's message takes them
@@ -406,7 +409,7 @@ impl<P: Platform> RemoteTask<P> {
             };
             Reply::new(move |v: (u32, Option<Vec<u8>>, u32)| reply.invoke(v))
         };
-        self.link.send(ToService::ExecIndirect3 {
+        let message = ToService::ExecIndirect3 {
             data: command_data,
             cmd_buffer_count,
             resource_count,
@@ -415,7 +418,12 @@ impl<P: Platform> RemoteTask<P> {
             fifo_event_value_in: fifo_event_value.load(Ordering::Relaxed),
             gpu_completion: token.id(),
             reply,
-        });
+        };
+        if execs_here() {
+            self.link.send_here(message);
+        } else {
+            self.link.send(message);
+        }
         let status = gpu_token.wait();
         // The reply's count of ids, bounded by the ids it sent (the service always sends as
         // many as it counts).
@@ -451,6 +459,23 @@ impl<P: Platform> Drop for RemoteTask<P> {
             drop(slot.get_mut().take());
         }
     }
+}
+
+/// Whether a remote exec is delivered on the FIFO thread, which then runs the service's job
+/// itself ([`ServiceLink::send_here`]): on, unless `REIMS_VGPU_TASK_INLINE` is `0`, read once per
+/// process, when the service's queues' workers run it, as every other message. Either way the
+/// FIFO thread waits for the reply, which comes back on the link's queue; delivered here, it
+/// saves two of the exec's four wakes of a waiting thread (the connection queue's worker and the
+/// service queue's) when both queues are idle, as they are between a FIFO's execs.
+fn execs_here() -> bool {
+    static HERE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var_os("REIMS_VGPU_TASK_INLINE").is_some_and(|v| v == "0")
+    });
+    #[cfg(test)]
+    if let Some(here) = tests::EXECS_HERE.with(std::cell::Cell::get) {
+        return here;
+    }
+    *HERE
 }
 
 /// Whether an isolated task can use `map`: every range a whole number of pages, at a host
@@ -749,6 +774,13 @@ mod tests {
     use zerocopy::IntoBytes;
 
     type P = FakePlatform;
+
+    thread_local! {
+        /// Whether this thread's execs are delivered here, in place of the process's switch
+        /// ([`execs_here`]).
+        pub(super) static EXECS_HERE: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
 
     /// Runs `f` as a FIFO command does: with a holder of its own, released at the
     /// command's end (the testkit has no real pool to push).
@@ -1405,8 +1437,19 @@ mod tests {
                     ..
                 } => {
                     reply.call((1, None, 0));
-                    g2.wait();
-                    ctx.complete(gpu_completion, 1);
+                    // The GPU completes later, on a thread of its own, as a Metal completion
+                    // handler does: the exec's handler runs on the FIFO thread, which waits
+                    // for it.
+                    let (g, ctx) = (
+                        g2.clone(),
+                        Ctx {
+                            host: Arc::clone(&ctx.host),
+                        },
+                    );
+                    std::thread::spawn(move || {
+                        g.wait();
+                        ctx.complete(gpu_completion, 1);
+                    });
                 }
                 other => standard(ctx, other),
             });
@@ -2502,6 +2545,193 @@ mod tests {
             wait_until(|| !s.lock().is_empty());
             assert_eq!(*s.lock(), vec![4]);
             assert_eq!(v.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// An exec is delivered on the FIFO thread (`send_here`): the service takes it there, after
+    /// every message sent before it, and a death there ends only the task.
+    mod here {
+        use super::*;
+        use std::sync::atomic::AtomicBool;
+        use std::thread::ThreadId;
+
+        const EXEC: &str = "execIndirect3WithData:cmdBufferCount:resourceCount:stampIndex:fifoEventValueIn:gpuCompletion:reply:";
+
+        /// The threads the scripted service took each message on, by selector.
+        type Threads = Arc<Mutex<Vec<(&'static str, ThreadId)>>>;
+
+        /// The standard service, recording the thread of each message; a discard takes 20 ms,
+        /// so an exec sent right after it finds the connection's queues busy.
+        fn recording(threads: &Threads) -> impl Fn(&Ctx, ToService<P>) + Send + Sync + 'static {
+            let threads = threads.clone();
+            move |ctx, m| {
+                threads
+                    .lock()
+                    .push((m.selector(), std::thread::current().id()));
+                if matches!(m, ToService::DiscardResources { .. }) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                standard(ctx, m)
+            }
+        }
+
+        /// The exec is taken on the FIFO thread, after the discard sent before it, which the
+        /// connection queue's worker delivered
+        #[test]
+        fn an_exec_is_taken_on_the_fifo_thread_after_the_messages_before_it() {
+            let threads: Threads = Arc::default();
+            let h = harness(recording(&threads));
+            let t = h.task();
+            let (discarded, d) = done();
+            t.discard_resources(Records::empty(), d);
+            let v = Arc::new(AtomicU64::new(0));
+            let (s, d) = done();
+            exec3(Hold::NONE, &t, None, 0, &v, d);
+            wait_until(|| !s.lock().is_empty());
+            assert_eq!(*s.lock(), vec![1]);
+            assert_eq!(*discarded.lock(), vec![1]);
+            let here = std::thread::current().id();
+            let seen = threads.lock().clone();
+            let at = |sel: &str| seen.iter().position(|(s, _)| *s == sel).unwrap();
+            let discard = at("discardResources:count:reply:");
+            let exec = at(EXEC);
+            assert!(discard < exec);
+            assert_ne!(seen[discard].1, here);
+            assert_eq!(seen[exec].1, here);
+        }
+
+        /// With the switch off, the exec is taken on the connection queue's worker
+        #[test]
+        fn with_the_switch_off_the_exec_is_taken_on_the_connection_queue() {
+            EXECS_HERE.with(|h| h.set(Some(false)));
+            let threads: Threads = Arc::default();
+            let h = harness(recording(&threads));
+            let t = h.task();
+            let v = Arc::new(AtomicU64::new(0));
+            let (s, d) = done();
+            exec3(Hold::NONE, &t, None, 0, &v, d);
+            wait_until(|| !s.lock().is_empty());
+            EXECS_HERE.with(|h| h.set(None));
+            assert_eq!(*s.lock(), vec![1]);
+            let seen = threads.lock().clone();
+            let exec = seen.iter().find(|(s, _)| *s == EXEC).unwrap();
+            assert_ne!(exec.1, std::thread::current().id());
+        }
+
+        /// The exec's reply, made on the FIFO thread while the link's queue is idle, runs there:
+        /// the FIFO's event value has advanced when the service's `reply` returns
+        #[test]
+        fn the_reply_runs_on_the_fifo_thread_when_the_link_queue_is_idle() {
+            let v = Arc::new(AtomicU64::new(0));
+            let at_reply: Arc<Mutex<Option<u64>>> = Arc::default();
+            let (v2, at2) = (v.clone(), at_reply.clone());
+            let h = harness(move |ctx, m| match m {
+                ToService::ExecIndirect3 {
+                    gpu_completion,
+                    reply,
+                    ..
+                } => {
+                    reply.call((1, None, 0));
+                    *at2.lock() = Some(v2.load(Ordering::SeqCst));
+                    ctx.complete(gpu_completion, 1);
+                }
+                other => standard(ctx, other),
+            });
+            let t = h.task();
+            // The link's queue has run everything the handshake sent it.
+            std::thread::sleep(Duration::from_millis(20));
+            let (s, d) = done();
+            exec3(Hold::NONE, &t, None, 0, &v, d);
+            wait_until(|| !s.lock().is_empty());
+            assert_eq!(*s.lock(), vec![1]);
+            assert_eq!(*at_reply.lock(), Some(1));
+        }
+
+        /// With the link's queue busy (a completion the host is still running), the reply goes
+        /// behind it on the queue's worker, in its order: the value has not advanced at the reply
+        #[test]
+        fn the_reply_goes_to_a_busy_link_queue_in_its_order() {
+            let gate = Gate::default();
+            let in_completion = Arc::new(AtomicBool::new(false));
+            let v = Arc::new(AtomicU64::new(0));
+            let at_reply: Arc<Mutex<Option<u64>>> = Arc::default();
+            let (v2, at2, g2, busy) = (
+                v.clone(),
+                at_reply.clone(),
+                gate.clone(),
+                in_completion.clone(),
+            );
+            let h = harness(move |ctx, m| match m {
+                ToService::ExecIndirect3 {
+                    gpu_completion,
+                    reply,
+                    ..
+                } => {
+                    wait_until(|| busy.load(Ordering::SeqCst));
+                    reply.call((1, None, 0));
+                    *at2.lock() = Some(v2.load(Ordering::SeqCst));
+                    g2.open();
+                    ctx.complete(gpu_completion, 1);
+                }
+                other => standard(ctx, other),
+            });
+            let t = h.task();
+            // The discard's completion runs on the link's queue and holds it until the exec's
+            // reply has been made.
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let (o2, g3, b2) = (order.clone(), gate.clone(), in_completion.clone());
+            let discarded: Completion = Arc::new(move |st, _| {
+                b2.store(true, Ordering::SeqCst);
+                g3.wait();
+                o2.lock().push(("discard", st.raw()));
+            });
+            t.discard_resources(Records::empty(), discarded);
+            let (s, d) = done();
+            exec3(Hold::NONE, &t, None, 0, &v, d);
+            wait_until(|| !s.lock().is_empty());
+            assert_eq!(*s.lock(), vec![1]);
+            assert_eq!(*at_reply.lock(), Some(0));
+            assert_eq!(*order.lock(), vec![("discard", 1)]);
+            assert_eq!(v.load(Ordering::SeqCst), 1);
+        }
+
+        /// A death in the service's code, taken on the FIFO thread, ends only that task: the
+        /// FIFO sees 4 and goes on, the dead task completes later commands with 4 inside the
+        /// call, and another task of the same device still runs its execs
+        #[test]
+        fn a_death_in_an_exec_taken_here_ends_only_its_task() {
+            let die = Arc::new(AtomicBool::new(true));
+            let died_on: Arc<Mutex<Option<ThreadId>>> = Arc::default();
+            let (die2, died2) = (die.clone(), died_on.clone());
+            let h = harness(move |ctx, m| {
+                if m.selector() == EXEC && die2.load(Ordering::SeqCst) {
+                    *died2.lock() = Some(std::thread::current().id());
+                    crate::fatal!(SERVICE_DEATH)
+                }
+                standard(ctx, m)
+            });
+            let dead = h.task();
+            let v = Arc::new(AtomicU64::new(0));
+            let (s, d) = done();
+            exec3(Hold::NONE, &dead, None, 0, &v, d);
+            assert_eq!(*s.lock(), vec![4]);
+            assert_eq!(v.load(Ordering::SeqCst), 0);
+            assert_eq!(*died_on.lock(), Some(std::thread::current().id()));
+            // This thread left the task's code with the death.
+            assert!(crate::tasks::isolation::TaskLife::current().is_none());
+            // The dead task answers 4 inside the call.
+            let (s, d) = done();
+            exec3(Hold::NONE, &dead, None, 0, &v, d);
+            assert_eq!(*s.lock(), vec![4]);
+            // Another task goes on.
+            die.store(false, Ordering::SeqCst);
+            let alive = h.task();
+            let w = Arc::new(AtomicU64::new(0));
+            let (s, d) = done();
+            exec3(Hold::NONE, &alive, None, 0, &w, d);
+            wait_until(|| !s.lock().is_empty());
+            assert_eq!(*s.lock(), vec![1]);
+            assert_eq!(w.load(Ordering::SeqCst), 1);
         }
     }
 }

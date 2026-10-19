@@ -238,6 +238,26 @@ impl SerialQueue {
         owned_chain().iter().any(|&(i, _)| i == id)
     }
 
+    /// The queue, held by the caller from now, when it is idle with nothing queued: no worker
+    /// runs a block of it and no sync caller holds or waits for it. A block or turn submitted from
+    /// now on waits behind the caller's, which [`HeldTurn::run`] runs on the caller's thread as a
+    /// sync block. `None`, holding nothing, when the queue is busy, and on a thread that owns it
+    /// already. Nothing waits and no thread is woken to take it.
+    pub fn hold_if_idle(&self) -> Option<HeldTurn<'_>> {
+        if self.is_current() {
+            return None;
+        }
+        let mut st = self.shared().state.lock();
+        if st.owner != Owner::Idle || !st.items.is_empty() {
+            return None;
+        }
+        st.owner = Owner::Caller;
+        Some(HeldTurn {
+            queue: self,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     /// Runs `f` on the caller's thread once every block submitted before it has run, and holds
     /// the queue until it returns. `f` starts with no handler (a raise in it with no handler of
     /// its own dies at the raise, whatever handler the caller has) and no holder
@@ -264,6 +284,28 @@ impl SerialQueue {
         let out = block.run(f);
         drop(release);
         out
+    }
+}
+
+/// A queue its caller holds ([`SerialQueue::hold_if_idle`]) until it runs its block or drops.
+/// Thread-bound (`!Send`): the caller gives the queue up.
+pub struct HeldTurn<'a> {
+    queue: &'a SerialQueue,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl HeldTurn<'_> {
+    /// Runs `f` as the queue's `sync` runs its block (module doc), then gives the queue up.
+    pub fn run<R>(self, f: impl FnOnce() -> R + Send) -> R {
+        let mut owned = owned_chain();
+        owned.push(self.queue.me());
+        Submitted::new(owned, false).run(f)
+    }
+}
+
+impl Drop for HeldTurn<'_> {
+    fn drop(&mut self) {
+        self.queue.shared().give_up();
     }
 }
 
@@ -484,6 +526,51 @@ mod tests {
             label: current_label(),
             ours: is_our_thread(),
         }
+    }
+
+    /// An idle queue is held at once: its block runs on the caller's thread with the queue
+    /// current, and a block submitted meanwhile runs after it
+    #[test]
+    fn hold_if_idle_runs_on_the_callers_thread_ahead_of_later_blocks() {
+        let queue = q("q");
+        queue.sync(|| ());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let turn = queue.hold_if_idle().expect("an idle queue");
+        let l = log.clone();
+        queue.exec_async(move || l.lock().push(("later", seen())));
+        std::thread::sleep(Duration::from_millis(20));
+        let l = log.clone();
+        turn.run(move || l.lock().push(("held", seen())));
+        queue.sync(|| ());
+        let log = log.lock().clone();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].0, "held");
+        assert_eq!(log[0].1.thread, std::thread::current().id());
+        assert_eq!(log[0].1.label, Some("q"));
+        assert_eq!(log[1].0, "later");
+        assert_ne!(log[1].1.thread, std::thread::current().id());
+    }
+
+    /// A busy queue, or one the thread owns, is not held, and nothing waits
+    #[test]
+    fn hold_if_idle_hands_a_busy_queue_back() {
+        let queue = q("q");
+        let (started, running) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        queue.exec_async(move || {
+            let _ = started.send(());
+            let _ = held.recv();
+        });
+        running.recv_timeout(WAIT).unwrap();
+        assert!(queue.hold_if_idle().is_none());
+        queue.exec_async(|| ());
+        drop(release);
+        queue.sync(|| ());
+        let q2 = queue.clone();
+        assert!(queue.sync(move || q2.hold_if_idle().is_none()));
+        // A turn dropped unrun gives the queue up.
+        drop(queue.hold_if_idle().expect("an idle queue"));
+        queue.sync(|| ());
     }
 
     /// Async blocks run in FIFO order

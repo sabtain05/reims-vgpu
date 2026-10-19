@@ -306,6 +306,36 @@ impl TaskLife {
     }
 }
 
+/// Runs `f` on this thread outside the task's code whose trap covers it: host code a task's
+/// thread runs in the link queue's place (a reply the link runs on the replying thread). A death
+/// in `f` is the process's, as on a thread no task's trap covers, and `f` never stops for the
+/// task's end. The trap comes back when `f` returns or unwinds.
+pub(crate) fn outside_the_task<R>(f: impl FnOnce() -> R) -> R {
+    /// Puts the thread's trap back.
+    struct Restore {
+        trap: Option<(Arc<TaskLife>, Mode)>,
+        in_task: bool,
+        leaks: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let trap = self.trap.take();
+            TRAP.with(|t| *t.borrow_mut() = trap);
+            IN_TASK.set(self.in_task);
+            LEAKS.set(self.leaks);
+        }
+    }
+    if !IN_TASK.get() {
+        return f();
+    }
+    let _restore = Restore {
+        trap: TRAP.with(|t| t.replace(None)),
+        in_task: IN_TASK.replace(false),
+        leaks: LEAKS.replace(false),
+    };
+    f()
+}
+
 /// A death that belongs to Metal, not to the task's own code: a Metal exception no handler takes,
 /// or a platform call that ends the process.
 fn inside_the_platform(id: &DeathId) -> bool {
@@ -453,6 +483,31 @@ mod tests {
         });
         assert!(raised.is_err());
         assert!(!life.has_ended());
+    }
+
+    /// Inside a run, code outside the task's dies as the process, leaves the task running, and
+    /// does not stop for the task's end; the trap comes back after it
+    #[test]
+    fn a_death_outside_the_task_inside_its_run_ends_the_process() {
+        let life = TaskLife::new();
+        let d = catch_death(|| life.run(|| outside_the_task(|| crate::fatal!(OURS))));
+        assert_eq!(d.map(|_| ()), Err(OURS));
+        assert!(!life.has_ended());
+        let l2 = life.clone();
+        let ran = life.run(|| {
+            assert!(TaskLife::current().is_some());
+            let outside = outside_the_task(|| {
+                assert!(TaskLife::current().is_none());
+                l2.exit();
+                // The task has ended: code outside it goes on.
+                l2.stop_if_ended();
+                7
+            });
+            assert!(Arc::ptr_eq(&TaskLife::current().unwrap(), &l2));
+            outside
+        });
+        assert_eq!(ran, Some(7));
+        assert!(TaskLife::current().is_none());
     }
 
     /// A carried callback runs as the task's code on any thread, and not once the task ended

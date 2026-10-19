@@ -9,6 +9,22 @@
 //! buffer, after the last command buffer that used it. A command buffer that may reach a released
 //! texture on the surface through its resource ID alone keeps that image's memory and not the
 //! buffer, so it holds no reference of the surface.
+//!
+//! **A heap core let go of** stays, as Metal's does: when the guest releases a detach heap, core
+//! keeps the cover buffer it made over all of the heap for good (`Kept::MetalNumbering`), and the
+//! cover holds the heap, its GPU address range and its numbering with it, as Metal's
+//! sub-allocation retain does. Once nothing else holds the heap or its cover (no handle of
+//! core's, no buffer or texture placed in the heap, no command), nothing reaches the heap's
+//! memory again, as nothing names the cover. Such a heap over the guest's pages is then detached
+//! ([`let_go_of_kept_heaps`], as each detach heap's cover is made): the runtime frees its import
+//! of the guest's pages, which the guest may have given to other objects since, and the views of
+//! its alias are parked (`crate::gpu::backing`'s `Parking`); the object, its GPU address and its
+//! numbering stay. Each such heap's import held
+//! the guest's pages it was last given until the process ended, on Linux a kernel mapping per run
+//! of them (measured on an RTX 5080 host, an x86-64 macOS 26.6.1 guest of 16 GiB at 3840x2400,
+//! 2026-10-18: once 13 apps had been opened and quit, none of the 699 heaps made over the guest's
+//! pages had gone, and the 421 of them not detached held 925 MiB of those pages in 236,846
+//! mappings, where every other view held 15,000).
 
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU64;
@@ -958,6 +974,37 @@ impl HeapObject {
     pub(crate) fn detach(&self) {
         self.backing.detach(|| self.raw.detach_backing());
     }
+}
+
+/// A heap made over address ranges whose cover was made ([`Placements`]), with its cover, until
+/// it goes or is detached ([`let_go_of_kept_heaps`]).
+type Covered = (Weak<HeapObject>, Weak<dyn std::any::Any + Send + Sync>);
+
+/// The heaps made over address ranges whose cover was made, which [`let_go_of_kept_heaps`]
+/// weighs. Held while it detaches them, so two threads never detach one heap at once.
+static COVERED: Mutex<Vec<Covered>> = Mutex::new(Vec::new());
+
+/// Detaches each heap over address ranges that nothing holds but its cover, the cover held by
+/// nothing but core, which keeps it for good once the guest released the heap (module docs, "A
+/// heap core let go of"): the cover holds a reference of its heap, so a heap whose only one is
+/// the cover's, and a cover with one alone, are held by nothing that could reach the heap's
+/// memory. A heap that went, or that is detached, leaves the list; one whose detach a command
+/// buffer in flight holds off ([`Backing::detach`]) is weighed again at the next call.
+pub(crate) fn let_go_of_kept_heaps() {
+    let mut covered = COVERED.lock();
+    covered.retain(|(heap, cover)| {
+        if heap.strong_count() != 1 || cover.strong_count() != 1 {
+            return heap.strong_count() > 0;
+        }
+        // The cover lives and holds the heap for good, so this reference is never the last.
+        let Some(heap) = heap.upgrade() else {
+            return false;
+        };
+        if !heap.backing.is_detached() {
+            heap.detach();
+        }
+        !heap.backing.is_detached()
+    });
 }
 
 /// `id<MTLHeap>`.
@@ -1993,6 +2040,12 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let range = offset..offset.saturating_add(length);
                 let cover = first && offset == 0 && length >= self.descriptor_size;
                 let object: Weak<dyn std::any::Any + Send + Sync> = Obj::downgrade(&buffer);
+                if cover && self.backing.detaches() {
+                    plain(let_go_of_kept_heaps);
+                    COVERED
+                        .lock()
+                        .push((Obj::downgrade(self), Weak::clone(&object)));
+                }
                 plain(|| self.placed.lock().place_buffer(sel, range, object, cover));
                 buffer
             })
@@ -3559,6 +3612,101 @@ pub(crate) mod tests {
         );
     }
 
+    /// Prints how long a texture on a surface over the guest's pages takes to make, as a
+    /// display's swap makes one over the surface it presents each frame, and its steps, for a
+    /// surface made over 2,025 runs of pages, as an x86 guest's 1920 × 1080 surface is, beside
+    /// 2,000 runs of core's mappings
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the time a call"]
+    fn a_texture_on_a_surface_over_2025_runs_a_swap() {
+        use crate::os::tests::{bgra_surface_over_runs, free, microseconds_a_call};
+        let (s, pages, length) = bgra_surface_over_runs(2025);
+        crate::remap::guest_mappings_for_measurements(0x7000_0000_0000, 2000, 0x10_0000_0000);
+        let d = dev();
+        let desc = bgra(s.width(), s.height(), 0);
+        let sel = "newTextureWithDescriptor:iosurface:plane:";
+        let made = || {
+            d.new_texture_on_surface(&desc, Some(&s), 0)
+                .unwrap()
+                .unwrap()
+        };
+        let whole = microseconds_a_call(200, || drop(made()));
+        let fields = desc.fields();
+        let descriptor = microseconds_a_call(200, || {
+            std::hint::black_box(fields.descriptor(sel, crate::gpu::desc::Maker::Surface));
+        });
+        let facts = microseconds_a_call(200, || {
+            std::hint::black_box((
+                crate::os::gpu_read_only(&s),
+                crate::os::plane(&s, 0),
+                crate::os::over_guest_pages(&s),
+            ));
+        });
+        let shared = Arc::new(s.clone_ref());
+        let space = microseconds_a_call(200, || {
+            std::hint::black_box(crate::gpu::metal_space::surface(
+                shared.id().0,
+                s.alloc_size(),
+            ));
+        });
+        let buffer = microseconds_a_call(200, || {
+            let space = Arc::new(crate::gpu::metal_space::surface(
+                shared.id().0,
+                s.alloc_size(),
+            ));
+            let token: rt::RangeToken = Box::new(space);
+            drop(d.buffer_over_surface(sel, &shared, token).unwrap().unwrap());
+        });
+        let t = made();
+        let memory = microseconds_a_call(200, || {
+            std::hint::black_box(crate::gpu::writes::texture_memory(&t));
+        });
+        let named = microseconds_a_call(200, || {
+            let memory = crate::remap::as_guests(crate::gpu::writes::texture_memory(&t).ranges);
+            crate::gpu::over_pages::over_surface(sel, memory.into(), t.life());
+        });
+        let kept = microseconds_a_call(200, || {
+            let memory = crate::gpu::writes::texture_named_memory(&t);
+            crate::gpu::over_pages::over_surface(sel, memory, t.life());
+        });
+        println!(
+            "a texture on a surface over 2,025 runs, µs a call: whole {whole:.1?}, descriptor \
+             {descriptor:.1?}, facts {facts:.1?}, space {space:.1?}, buffer {buffer:.1?}, \
+             memory {memory:.1?}, memory named and kept {named:.1?}, as the surface's record \
+             keeps it {kept:.1?}"
+        );
+        drop((t, shared, s));
+        free(pages, length);
+    }
+
+    /// Textures on a surface over the guest's pages, as a display's swap makes one each frame,
+    /// name their texels' memory as the guest's pages are through the surface's record: two of
+    /// one size share what it named, which is what naming their memory answers, and one of fewer
+    /// rows names its own bytes
+    #[test]
+    fn textures_on_a_surface_over_the_guests_pages_share_its_named_memory() {
+        use crate::gpu::writes::{texture_memory, texture_named_memory};
+        let (s, pages, length) = crate::os::tests::bgra_surface_over_runs(8);
+        let d = dev();
+        let made = |height| {
+            d.new_texture_on_surface(&bgra(s.width(), height, 0), Some(&s), 0)
+                .unwrap()
+                .unwrap()
+        };
+        let fresh = |t: &VulkanTexture| crate::remap::as_guests(texture_memory(t).ranges);
+        let (one, two) = (made(s.height()), made(s.height()));
+        let named = texture_named_memory(&one);
+        assert!(Arc::ptr_eq(&named, &texture_named_memory(&two)));
+        assert_eq!(&*named, &fresh(&two)[..]);
+        let fewer = made(s.height() / 2);
+        let half = texture_named_memory(&fewer);
+        assert!(!Arc::ptr_eq(&half, &named));
+        assert_eq!(&*half, &fresh(&fewer)[..]);
+        assert!(half.len() < named.len(), "{} {}", half.len(), named.len());
+        drop((one, two, fewer, s));
+        crate::os::tests::free(pages, length);
+    }
+
     /// A texture on a surface writes the surface's memory, and holds one reference of the
     /// surface while it lives; its views share that reference. One over plane 1 of the surface,
     /// which has no planes, dies where it is made
@@ -4335,6 +4483,46 @@ pub(crate) mod tests {
             .unwrap();
         heap.detach_backing().unwrap();
         heap
+    }
+
+    /// A detach heap the guest released, which only the cover buffer core keeps for good still
+    /// holds, is detached at the next weighing, its GPU address kept; one that core's handle, a
+    /// buffer placed in it or a second reference of its cover still holds is not, until that goes
+    /// too (module docs, "A heap core let go of")
+    #[test]
+    fn a_heap_its_kept_cover_alone_holds_is_detached() {
+        let (p, d) = (platform(), dev());
+        for holder in ["none", "core's handle", "a buffer", "the cover"] {
+            let heap = detached_heap(&p, &d);
+            let options = heap.resource_options();
+            let cover = heap
+                .new_buffer_of_length(over_pages(), options, 0)
+                .unwrap()
+                .unwrap();
+            replace_heap(&p, &heap, guest_pages());
+            let at = heap.gpu_address();
+            let weak = Obj::downgrade(&heap);
+            let held: Option<Box<dyn std::any::Any>> = match holder {
+                "none" => None,
+                "core's handle" => Some(Box::new(heap.clone_ref())),
+                "a buffer" => Some(Box::new(
+                    heap.new_buffer_of_length(0x100, options, 0x100)
+                        .unwrap()
+                        .unwrap(),
+                )),
+                _ => Some(Box::new(cover.clone_ref())),
+            };
+            // Core keeps the cover for good, and lets go of the heap.
+            std::mem::forget(cover);
+            drop(heap);
+            let_go_of_kept_heaps();
+            let detached = || weak.upgrade().unwrap().backing.is_detached();
+            assert_eq!(detached(), held.is_none(), "{holder}");
+            drop(held);
+            let_go_of_kept_heaps();
+            assert!(detached(), "{holder}, once it went");
+            assert_eq!(weak.upgrade().unwrap().raw.gpu_address().0, at, "{holder}");
+        }
     }
 
     /// `heap`'s backing replaced with the pages at `address`, as core's first prepare gives a

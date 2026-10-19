@@ -25,7 +25,8 @@
 //! - **Lookups** (`map`): the first containing range decides and a straddle is refused, while a
 //!   range mapping splits across contiguous ranges. Guest physical 0 is refused even with
 //!   length 0. A write tests its source, not the translation. A failed protect deallocates and
-//!   still returns the mapping; a length of 0 passes the page assert.
+//!   still returns the mapping, whose release frees nothing more; a length of 0 passes the page
+//!   assert.
 //! - **Mappings** (`mapping`): the last release runs the teardown, and a mapping of the root
 //!   task or of a host task unmaps through its device while the device's fields live, so
 //!   mappings released during the device's teardown still unmap; one released after skips it.

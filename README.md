@@ -184,6 +184,7 @@ reads them once per process, and an unset or unparsable value is the default.
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS: SDL3's window in place of AppKit's |
 | `REIMS_VGPU_STRICT=1` | the Vulkan platform: end the process at each difference from Metal's answer it would otherwise log |
 | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ([docs/accuracy-ledger.md](docs/accuracy-ledger.md)) |
+| `REIMS_VGPU_UNMAP_THREAD=0` | the Vulkan platform: unmap guest memory the GPU is done with inside the guest's call, not on a thread of its own |
 
 The guest's mode is QEMU's `apple-gfx` property `resolution=` (`2560x1600`, `2560x1600@200` for a
 density, or `host`; 1920x1080 at 1× by default), which `reims-ctl`'s resolution and HiDPI settings

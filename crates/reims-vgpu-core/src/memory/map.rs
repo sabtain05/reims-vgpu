@@ -262,8 +262,9 @@ impl<P: Platform> MemoryMap<P> {
     }
 
     /// A fresh VM allocation with each request range remapped into it, in request order; every
-    /// refusal after the allocation deallocates it, except a failed protect. A length that is not
-    /// whole pages dies.
+    /// refusal after the allocation deallocates it; so does a failed protect, which still answers
+    /// a mapping, one whose release frees nothing, as the range may be another's by then. A
+    /// length that is not whole pages dies.
     pub fn new_range_mapping(
         &self,
         ranges: &[PhysRange],
@@ -356,18 +357,22 @@ impl<P: Platform> MemoryMap<P> {
         } else {
             VmProt::READ | VmProt::WRITE
         };
-        if vm.protect_max(address, total_length, prot).is_err() {
-            // Deallocated, then the mapping is made anyway.
+        let teardown = if vm.protect_max(address, total_length, prot).is_err() {
+            // Deallocated, then the mapping is made anyway, with no teardown: the range is freed
+            // once, and a later allocation that takes the address keeps its pages.
             free_all();
-        }
+            Teardown::None
+        } else {
+            Teardown::Vm {
+                platform: self.platform.clone(),
+            }
+        };
         // Writable unless read-only; making the mapping never fails.
         Some(Mapping::new(
             address,
             total_length,
             read_only == 0,
-            Teardown::Vm {
-                platform: self.platform.clone(),
-            },
+            teardown,
         ))
     }
 
@@ -1184,7 +1189,8 @@ mod tests {
             assert_eq!(c[2].sel, "mach_vm_deallocate");
         }
 
-        /// A failed protect deallocates, then returns the mapping anyway.
+        /// A failed protect deallocates, then returns the mapping anyway, whose release frees the
+        /// range no second time.
         #[test]
         fn a_failed_protect_still_returns_the_mapping() {
             let p = plat();
@@ -1203,7 +1209,7 @@ mod tests {
                 ]
             );
             drop(mp);
-            assert_eq!(p.call_log().count("mach_vm_deallocate"), 2);
+            assert_eq!(p.call_log().count("mach_vm_deallocate"), 1);
         }
 
         #[test]

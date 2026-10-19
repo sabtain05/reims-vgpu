@@ -6,6 +6,7 @@
 //! installed.
 
 mod budget;
+mod census;
 mod clock;
 mod dma_buf;
 mod files;
@@ -26,13 +27,20 @@ pub use surface::{LinuxSurface, LinuxSurfaces};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
 
+pub(crate) use hints::drop_inherited_hints;
 pub(crate) use import::{
     TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view, shown_at,
 };
 pub(crate) use surface::{plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix};
-pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]
 pub(crate) use vm::tests::{PAGE, mapped, writable};
+pub(crate) use vm::{Parked, allocate_aliasable, park, unpark};
+
+/// Runs `f` with the views it makes on this thread counted as aliases' in the census of the
+/// views' mappings (`census`).
+pub(crate) fn as_alias<R>(f: impl FnOnce() -> R) -> R {
+    census::as_kind(census::Kind::Alias, f)
+}
 
 /// The instance's surface extensions a display's window may present over, besides
 /// `VK_KHR_surface`, each asked for where the loader lists it (`crate::os`'s `wsi`): Wayland's,

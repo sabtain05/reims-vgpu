@@ -16,9 +16,13 @@
 //! buffer is detached, replaced, or both before the signal ([`behind_a_wait`]): this crate's
 //! fails a use detached then as Metal's does, in the first submission or a later one, and dies
 //! at a use replaced then, also in a submission after one a detached use failed, where Metal
-//! runs it over the new pages (`src/gpu/command.rs`'s docs). A buffer placed in a heap over
-//! address ranges detaches the heap on both, and one in a plain heap, as the plain heap, never
-//! detaches ([`placed_detach`]).
+//! runs it over the new pages (`src/gpu/command.rs`'s docs). Behind waits on plain events the
+//! GPU signals, Metal decides the submission as it schedules the command buffer, once for each
+//! event a command buffer that signals it at the value waited for or past it was committed, or
+//! at its commit where the event holds such a value, and from then on the objects it uses are in
+//! flight, as below ([`behind_a_gpu_wait`], [`behind_gpu_waits`], measured on Metal only). A
+//! buffer placed in a heap over address ranges detaches the heap on both, and one in a plain
+//! heap, as the plain heap, never detaches ([`placed_detach`]).
 //!
 //! A detach while a command buffer submitted and not yet completed took the object answers NO
 //! on both, a heap's at once and a buffer's once the command buffer completed, where Metal's
@@ -42,6 +46,7 @@
 use std::os::unix::process::ExitStatusExt as _;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
@@ -49,6 +54,7 @@ use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_core::platform::os::clock::{Clock, MonoTime};
 use reims_vgpu_core::platform::os::vm::{HostVm, VmProt};
 use reims_vgpu_core::platform::resource::{Buffer, Heap, Library, Texture};
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange, ResourceAddressRange};
@@ -58,6 +64,7 @@ use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_metal::os::vm::MetalVm;
+use reims_vgpu_metal::spi::methods::{BufferSpi, HeapSpi};
 use reims_vgpu_vulkan::VulkanPlatform;
 
 const PAGE: u64 = 0x4000;
@@ -1225,6 +1232,535 @@ fn behind_a_wait_on_vulkan() {
     }
 }
 
+/// A platform whose detach a test reads the answer of: Metal's `detachBacking` BOOL, which the
+/// platform's `detach_backing` drops.
+trait Answers: Platform {
+    /// A buffer's `detachBacking`.
+    fn detach_buffer(buffer: &Self::Buffer) -> bool;
+    /// A heap's `detachBacking`.
+    fn detach_heap(heap: &Self::Heap) -> bool;
+}
+
+impl Answers for MetalPlatform {
+    fn detach_buffer(buffer: &Self::Buffer) -> bool {
+        BufferSpi::detachBacking(buffer.get())
+    }
+
+    fn detach_heap(heap: &Self::Heap) -> bool {
+        HeapSpi::detachBacking(heap.get())
+    }
+}
+
+/// The cases of [`behind_a_gpu_wait`].
+const BEHIND_A_GPU_WAIT: [&str; 5] = [
+    "detached",
+    "replaced",
+    "detached, then replaced",
+    "heap detached",
+    "heap detached, then replaced",
+];
+
+/// When [`behind_a_gpu_wait`]'s signal is committed: after the window, behind a short blit; or
+/// behind [`SPIN`]'s kernel of [`ROUNDS`] rounds, before the waiting command buffer, as core's
+/// paging buffer is before the exec behind it, or [`STAND`] after it, before the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Signal {
+    After,
+    First,
+    Between,
+}
+
+/// How long [`behind_a_gpu_wait`] lets the waiting command buffer stand, committed, before the
+/// window's calls.
+const STAND: Duration = Duration::from_millis(10);
+
+/// How long [`behind_a_gpu_wait`] waits for the window's calls to return before it commits the
+/// signal anyway: a call that waits for the waiting command buffer to complete would otherwise
+/// never return.
+const BLOCKED: Duration = Duration::from_millis(500);
+
+/// A buffer over the guest's pages `over` as core makes one, of a page (detached at once over a
+/// temporary allocation, and replaced by `over` where `replaced`), or, for `heap`, a buffer
+/// placed at the start of a heap over four pages made the same way: the buffer, and the heap.
+fn gpu_wait_target<P: Platform>(
+    p: &P,
+    dev: &P::Device,
+    heap: bool,
+    over: HostPtr,
+    replaced: bool,
+) -> (P::Buffer, Option<P::Heap>) {
+    let size = if heap { 4 * PAGE } else { PAGE };
+    let array = p.new_address_range_array(&[range(over, 0, size)]).unwrap();
+    if !heap {
+        let buffer = detached_buffer::<P>(dev, 1);
+        if replaced {
+            assert!(buffer.replace_backing(&array, false).unwrap());
+        }
+        return (buffer, None);
+    }
+    let dummy = pages(4, 0);
+    let ranges = p.new_address_range_array(&[range(dummy, 0, size)]).unwrap();
+    let made = dev
+        .new_heap(&HeapDesc {
+            size,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+            address_ranges: Some(&ranges),
+            pinned_gpu_address: None,
+        })
+        .unwrap();
+    let options = made.descriptor_resource_options;
+    let heap = made.heap.unwrap();
+    let target = heap
+        .new_buffer_of_length(PAGE, options, 0)
+        .unwrap()
+        .unwrap();
+    heap.detach_backing().unwrap();
+    assert!(heap.replace_backing(&array, false).unwrap());
+    assert!(vm_free(dummy, size));
+    (target, Some(heap))
+}
+
+/// Case `case` of [`BEHIND_A_GPU_WAIT`]: a buffer over guest pages, or a buffer placed in a heap
+/// over them (detached over a temporary allocation, for `replaced`), whose fill a command buffer
+/// on one queue commits behind a wait on a plain event (`newEvent`), which only the GPU
+/// signals, from a command buffer on another queue committed as `signal` says ([`Signal`]).
+/// With the waiting command buffer committed for [`STAND`], the window: the object is detached,
+/// replaced by other pages, or both, on a thread of its own. A signal after the window is
+/// committed once the window's calls returned or [`BLOCKED`] passed; then both complete. What
+/// shows: the waiting command buffer's status as the window opened, and whether its
+/// `waitUntilScheduled` had returned on another thread by then; the window's answers, and
+/// whether the fill had landed in the guest's pages as they returned; then the waiting command
+/// buffer's status and error code, and the first byte of the guest's pages the object was over
+/// and of those it was replaced by.
+fn behind_a_gpu_wait<P: Answers>(p: &P, dev: &P::Device, case: &str, order: Signal) -> Steps {
+    let heap = case.starts_with("heap");
+    let size = if heap { 4 * PAGE } else { PAGE };
+    let over = pages(size / PAGE, 0x01);
+    let new = pages(size / PAGE, 0x03);
+    let (target, made) = gpu_wait_target(p, dev, heap, over, case != "replaced");
+    let replacement = p.new_address_range_array(&[range(new, 0, size)]).unwrap();
+    let (first, second) = (
+        dev.new_command_queue().unwrap(),
+        dev.new_command_queue().unwrap(),
+    );
+    let gate = dev.new_event(OnFault::Return).unwrap().unwrap();
+    let other = plain_buffer::<P>(dev);
+    let signal = command_buffer::<P>(&second);
+    if order != Signal::After {
+        // SAFETY: the buffer's own Shared contents, one page.
+        unsafe { other.contents().as_ptr::<u32>().write_volatile(ROUNDS) };
+        spin::<P>(dev, &signal, &other);
+        signal
+            .encode_signal(Some(EventRef::Event(&gate)), 1)
+            .unwrap();
+    }
+    if order == Signal::First {
+        signal.commit(OnFault::Return).unwrap();
+    }
+    let waiting = command_buffer::<P>(&first);
+    waiting
+        .encode_wait(Some(EventRef::Event(&gate)), 1)
+        .unwrap();
+    blit::<P>(&waiting, vec![fill::<P>(&target, 0, 0x5c)]);
+    waiting.commit(OnFault::Return).unwrap();
+    if order == Signal::Between {
+        std::thread::sleep(STAND);
+        signal.commit(OnFault::Return).unwrap();
+    }
+    let clock = p.clock();
+    let (status_before, scheduled_first, answers, landed) = std::thread::scope(|s| {
+        let scheduled = s.spawn(|| {
+            waiting.wait_until_scheduled().unwrap();
+            clock.now_mono()
+        });
+        std::thread::sleep(STAND);
+        let status_before = waiting.status().0;
+        let opened = clock.now_mono();
+        let (returned, calls) = mpsc::channel();
+        let (target, made, replacement) = (&target, &made, &replacement);
+        let window = s.spawn(move || {
+            let mut answers = Vec::new();
+            if case != "replaced" {
+                answers.push(match made {
+                    Some(heap) => P::detach_heap(heap),
+                    None => P::detach_buffer(target),
+                });
+            }
+            if case.contains("replaced") {
+                answers.push(match made {
+                    Some(heap) => heap.replace_backing(replacement, false).unwrap(),
+                    None => target.replace_backing(replacement, false).unwrap(),
+                });
+            }
+            let landed = read(over, 0) == 0x5c;
+            returned.send(()).unwrap();
+            (answers, landed)
+        });
+        if order == Signal::After {
+            let _ = calls.recv_timeout(BLOCKED);
+            blit::<P>(&signal, vec![fill::<P>(&other, 0, 0x11)]);
+            signal
+                .encode_signal(Some(EventRef::Event(&gate)), 1)
+                .unwrap();
+            signal.commit(OnFault::Return).unwrap();
+        }
+        let (answers, landed) = window.join().unwrap();
+        let scheduled_first = scheduled.join().unwrap().as_nanos() < opened.as_nanos();
+        (status_before, scheduled_first, answers, landed)
+    });
+    signal.wait_until_completed(OnFault::Return).unwrap();
+    waiting.wait_until_completed(OnFault::Return).unwrap();
+    vec![
+        (
+            "as the window opened: status, scheduled",
+            vec![status_before, u64::from(scheduled_first)],
+        ),
+        (
+            "the window's answers",
+            answers.into_iter().map(u64::from).collect(),
+        ),
+        ("as they returned: the fill landed", vec![u64::from(landed)]),
+        (
+            "completed: status, error, the bytes",
+            vec![
+                waiting.status().0,
+                waiting
+                    .error()
+                    .map_or(0, |e| u64::try_from(e.code).unwrap()),
+                u64::from(read(over, 0)),
+                u64::from(read(new, 0)),
+            ],
+        ),
+    ]
+}
+
+/// What Metal does in [`behind_a_gpu_wait`] (measured on the M3 Max, macOS 27.0.1, 26A434, on a
+/// GPU nothing else used: 40 runs of each case with the signal after the window and with it
+/// first, 20 with it between).
+///
+/// Metal schedules a command buffer waiting on a plain event once a command buffer that signals
+/// it was committed, the GPU then waiting, and decides its submission then. Committed before
+/// any, it stays `Committed` until the signal, as behind a shared event the CPU sets
+/// ([`behind_a_wait`]): a detach then answers YES at once, and the command buffer fails with
+/// code 8 where it uses an object detached as the signal comes, and runs over the new pages
+/// where it was replaced. Once it is scheduled, the objects it uses are in flight
+/// ([`in_flight`]): a heap's detach answers NO at once and the replace after it NO, a buffer's
+/// returns once the command buffer completed (104 to 125 ms, the signal's
+/// kernel's time) and answers NO, YES in 2 of 120 runs, as the in-flight answer races
+/// ([`expected_in_flight`]), and the command buffer runs over the pages it had. A buffer
+/// detached as it was scheduled fails it with code 8 though a replace (YES) comes before the
+/// signal. The calls that did not wait for a command buffer returned in 33 to 219 µs.
+fn expected_behind_a_gpu_wait(order: Signal, case: &str) -> Steps {
+    let detached = case != "replaced";
+    let replaced = case.contains("replaced");
+    let calls = usize::from(detached) + usize::from(replaced);
+    let (opened, answers, landed, completed) = match order {
+        Signal::After if replaced => (vec![2, 0], vec![1; calls], 0, vec![4, 0, 0x01, 0x5c]),
+        Signal::After => (vec![2, 0], vec![1; calls], 0, vec![5, 8, 0x01, 0x03]),
+        _ if !detached => (vec![3, 1], vec![1], 0, vec![5, 8, 0x01, 0x03]),
+        _ => (
+            vec![3, 1],
+            vec![0; calls],
+            u64::from(!case.starts_with("heap")),
+            vec![4, 0, 0x5c, 0x03],
+        ),
+    };
+    vec![
+        ("as the window opened: status, scheduled", opened),
+        ("the window's answers", answers),
+        ("as they returned: the fill landed", vec![landed]),
+        ("completed: status, error, the bytes", completed),
+    ]
+}
+
+/// `steps` of [`behind_a_gpu_wait`] without the answers of a buffer's detach in flight and the
+/// replace after it, which Metal does not decide ([`expected_behind_a_gpu_wait`]).
+fn gpu_wait_answer_not_compared(mut steps: Steps, order: Signal, case: &str) -> Steps {
+    if order != Signal::After && case.starts_with("detached") {
+        let (name, words) = &mut steps[1];
+        assert_eq!(*name, "the window's answers");
+        *name = "the window's answers, not compared";
+        words.clear();
+    }
+    steps
+}
+
+/// [`behind_a_gpu_wait`] on Metal, each case with the signal after the window, first and
+/// between, a buffer's answers in flight not compared ([`gpu_wait_answer_not_compared`]): run
+/// alone, as other GPU work (a fault's recovery) changes when Metal's command buffers complete
+#[test]
+fn behind_a_gpu_wait_on_metal() {
+    let Some(dev) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = MetalPlatform::new(Box::new(NoLauncher));
+    for order in [Signal::After, Signal::First, Signal::Between] {
+        for case in BEHIND_A_GPU_WAIT {
+            let seen = behind_a_gpu_wait(&p, &dev, case, order);
+            assert_eq!(
+                gpu_wait_answer_not_compared(seen, order, case),
+                gpu_wait_answer_not_compared(expected_behind_a_gpu_wait(order, case), order, case),
+                "{case}, signal {order:?}"
+            );
+        }
+    }
+}
+
+/// The cases of [`behind_gpu_waits`].
+const BEHIND_GPU_WAITS: [&str; 5] = [
+    "a lower value",
+    "two events",
+    "signalled before",
+    "a higher value",
+    "a higher value after",
+];
+
+/// Case `case` of [`BEHIND_GPU_WAITS`], over a buffer or, for `heap`, a heap over guest pages
+/// ([`gpu_wait_target`]): a command buffer on one queue waits on plain events (`newEvent`) and
+/// fills the buffer. For `a lower value`, it waits on an event at 2, which a command buffer on a
+/// second queue signals at 1 behind [`SPIN`]'s kernel of [`ROUNDS`] rounds, committed before
+/// it; a second signaller, at 2, follows on the second queue after the window. For `two events`,
+/// it waits on two events at 1, one signalled so, committed before it, the other by a second
+/// signaller on a third queue after the window, behind [`SPIN`]'s kernel too. For `signalled
+/// before`, the event was signalled at 1 by a command buffer that completed before the waiting
+/// one was committed, which runs [`SPIN`]'s kernel before its fill. For `a higher value`, it
+/// waits on an event at 2, which the command buffer committed before it signals at 3, behind
+/// the kernel; for `a higher value after`, that one signals another event, and a second
+/// signaller, at 3, follows on the second queue after the window. With the waiting command
+/// buffer committed for [`STAND`], the window: the object is detached on a thread of its own,
+/// and the second signaller, where there is one, is committed once the detach returned or
+/// [`BLOCKED`] passed. What shows: the waiting command buffer's status as the window opened;
+/// the detach's answer, whether the fill had landed in the guest's pages as it returned and
+/// whether it returned before the second signaller's commit; whether the waiting command buffer
+/// was scheduled before the window and before the second signaller's commit, and the
+/// signallers' statuses then (0 for none); and its status, error code and the first byte of the
+/// guest's pages, once all completed.
+fn behind_gpu_waits<P: Answers>(p: &P, dev: &P::Device, case: &str, heap: bool) -> Steps {
+    let over = pages(if heap { 4 } else { 1 }, 0x01);
+    let (target, made) = gpu_wait_target(p, dev, heap, over, true);
+    let (first, second, third) = (
+        dev.new_command_queue().unwrap(),
+        dev.new_command_queue().unwrap(),
+        dev.new_command_queue().unwrap(),
+    );
+    let (gate, other_gate) = (
+        dev.new_event(OnFault::Return).unwrap().unwrap(),
+        dev.new_event(OnFault::Return).unwrap().unwrap(),
+    );
+    let spun = |words: &P::Buffer| {
+        // SAFETY: the buffer's own Shared contents, one page.
+        unsafe { words.contents().as_ptr::<u32>().write_volatile(ROUNDS) };
+    };
+    let (words, waiting_words, later_words, other) = (
+        plain_buffer::<P>(dev),
+        plain_buffer::<P>(dev),
+        plain_buffer::<P>(dev),
+        plain_buffer::<P>(dev),
+    );
+    let signaller = command_buffer::<P>(&second);
+    if case == "signalled before" {
+        blit::<P>(&signaller, vec![fill::<P>(&other, 0, 0x11)]);
+    } else {
+        spun(&words);
+        spin::<P>(dev, &signaller, &words);
+    }
+    let (signalled, value) = match case {
+        "a higher value" => (&gate, 3),
+        "a higher value after" => (&other_gate, 1),
+        _ => (&gate, 1),
+    };
+    signaller
+        .encode_signal(Some(EventRef::Event(signalled)), value)
+        .unwrap();
+    signaller.commit(OnFault::Return).unwrap();
+    if case == "signalled before" {
+        signaller.wait_until_completed(OnFault::Return).unwrap();
+    }
+    let waiting = command_buffer::<P>(&first);
+    match case {
+        "a lower value" | "a higher value" | "a higher value after" => {
+            waiting
+                .encode_wait(Some(EventRef::Event(&gate)), 2)
+                .unwrap();
+        }
+        "two events" => {
+            waiting
+                .encode_wait(Some(EventRef::Event(&gate)), 1)
+                .unwrap();
+            waiting
+                .encode_wait(Some(EventRef::Event(&other_gate)), 1)
+                .unwrap();
+        }
+        _ => {
+            waiting
+                .encode_wait(Some(EventRef::Event(&gate)), 1)
+                .unwrap();
+            spun(&waiting_words);
+            spin::<P>(dev, &waiting, &waiting_words);
+        }
+    }
+    blit::<P>(&waiting, vec![fill::<P>(&target, 0, 0x5c)]);
+    waiting.commit(OnFault::Return).unwrap();
+    let later = match case {
+        "a lower value" => Some((command_buffer::<P>(&second), &gate, 2)),
+        "a higher value after" => Some((command_buffer::<P>(&second), &gate, 3)),
+        "two events" => Some((command_buffer::<P>(&third), &other_gate, 1)),
+        _ => None,
+    };
+    if let Some((later, event, value)) = &later {
+        if case == "two events" {
+            spun(&later_words);
+            spin::<P>(dev, later, &later_words);
+        } else {
+            blit::<P>(later, vec![fill::<P>(&other, 256, 0x22)]);
+        }
+        later
+            .encode_signal(Some(EventRef::Event(*event)), *value)
+            .unwrap();
+    }
+    let clock = p.clock();
+    let mut steps = std::thread::scope(|s| {
+        let scheduled = s.spawn(|| {
+            waiting.wait_until_scheduled().unwrap();
+            let later = later.as_ref().map(|(later, _, _)| later.status().0);
+            (clock.now_mono(), signaller.status().0, later)
+        });
+        std::thread::sleep(STAND);
+        let status = waiting.status().0;
+        let opened = clock.now_mono();
+        let (returned, calls) = mpsc::channel();
+        let (target, made) = (&target, &made);
+        let window = s.spawn(move || {
+            let answer = match made {
+                Some(heap) => P::detach_heap(heap),
+                None => P::detach_buffer(target),
+            };
+            let landed = read(over, 0) == 0x5c;
+            returned.send(()).unwrap();
+            (answer, landed)
+        });
+        let returned_first = calls.recv_timeout(BLOCKED).is_ok();
+        let second_committed = later.as_ref().map(|(later, _, _)| {
+            later.commit(OnFault::Return).unwrap();
+            clock.now_mono()
+        });
+        let (answer, landed) = window.join().unwrap();
+        let (scheduled_at, signaller_status, later_status) = scheduled.join().unwrap();
+        let before = |at: MonoTime| u64::from(scheduled_at.as_nanos() < at.as_nanos());
+        let steps: Steps = vec![
+            ("at the window: status", vec![status]),
+            (
+                "the detach: answer, the fill landed, returned before the second commit",
+                vec![
+                    u64::from(answer),
+                    u64::from(landed),
+                    u64::from(returned_first),
+                ],
+            ),
+            (
+                "scheduled: before the window, before the second commit; the signallers' status",
+                vec![
+                    before(opened),
+                    second_committed.map_or(1, before),
+                    signaller_status,
+                    later_status.unwrap_or(0),
+                ],
+            ),
+        ];
+        steps
+    });
+    if let Some((later, _, _)) = &later {
+        later.wait_until_completed(OnFault::Return).unwrap();
+    }
+    signaller.wait_until_completed(OnFault::Return).unwrap();
+    waiting.wait_until_completed(OnFault::Return).unwrap();
+    steps.push((
+        "completed: status, error, the byte",
+        vec![
+            waiting.status().0,
+            waiting
+                .error()
+                .map_or(0, |e| u64::try_from(e.code).unwrap()),
+            u64::from(read(over, 0)),
+        ],
+    ));
+    steps
+}
+
+/// What Metal does in [`behind_gpu_waits`] (measured on the M3 Max, macOS 27.0.1, 26A434, 20 runs
+/// of each case over a buffer and over a heap, on a GPU nothing else used).
+///
+/// Metal schedules a command buffer waiting on plain events once, for each of them, a command
+/// buffer that signals it at the value waited for or past it was committed, or the event holds
+/// such a value. A signaller of a lower value, or of one of two events, leaves it `Committed`,
+/// and a detach then answers YES at once (30 to 440 µs). It is scheduled 197 to 507 µs after
+/// the second signaller's commit, at the value or past it, while the signallers' kernels still
+/// run, and then fails with code 8 over the object detached, running nothing. Behind an event a
+/// completed command buffer signalled, or one a command buffer committed before it signals past
+/// the value, it is scheduled at its commit, and the objects it uses are in flight: a heap's
+/// detach answers NO at once (51 to 108 µs), a buffer's once the command buffer completed (104
+/// to 109 ms), NO in all 40 runs, as the in-flight answer may race ([`expected_in_flight`]); it
+/// then runs over the pages it had.
+fn expected_behind_gpu_waits(case: &str, heap: bool) -> Steps {
+    let (status, detach, scheduled, completed) = match case {
+        "signalled before" | "a higher value" => (
+            3,
+            vec![0, u64::from(!heap), 1],
+            vec![1, 1, if case == "a higher value" { 3 } else { 4 }, 0],
+            vec![4, 0, 0x5c],
+        ),
+        _ => (2, vec![1, 0, 1], vec![0, 0, 3, 3], vec![5, 8, 0x01]),
+    };
+    vec![
+        ("at the window: status", vec![status]),
+        (
+            "the detach: answer, the fill landed, returned before the second commit",
+            detach,
+        ),
+        (
+            "scheduled: before the window, before the second commit; the signallers' status",
+            scheduled,
+        ),
+        ("completed: status, error, the byte", completed),
+    ]
+}
+
+/// `steps` of [`behind_gpu_waits`] without the answer of a buffer's detach in flight, which
+/// Metal does not decide ([`expected_in_flight`]).
+fn gpu_waits_answer_not_compared(mut steps: Steps, case: &str, heap: bool) -> Steps {
+    if matches!(case, "signalled before" | "a higher value") && !heap {
+        let (name, words) = &mut steps[1];
+        assert_eq!(
+            *name,
+            "the detach: answer, the fill landed, returned before the second commit"
+        );
+        *name = "the detach: the fill landed, returned before the second commit";
+        words.remove(0);
+    }
+    steps
+}
+
+/// [`behind_gpu_waits`] on Metal, each case over a buffer and over a heap, a buffer's answer in
+/// flight not compared ([`gpu_waits_answer_not_compared`]): run alone, as other GPU work (a
+/// fault's recovery) changes when Metal's command buffers complete
+#[test]
+fn behind_gpu_waits_on_metal() {
+    let Some(dev) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = MetalPlatform::new(Box::new(NoLauncher));
+    for case in BEHIND_GPU_WAITS {
+        for heap in [false, true] {
+            assert_eq!(
+                gpu_waits_answer_not_compared(behind_gpu_waits(&p, &dev, case, heap), case, heap),
+                gpu_waits_answer_not_compared(expected_behind_gpu_waits(case, heap), case, heap),
+                "{case}, heap {heap}"
+            );
+        }
+    }
+}
+
 /// Two fresh pages of the host after `case`: 0 leaves them readable and writable, 1 takes all
 /// access from the second, 2 from both, 3 unmaps the second, 4 leaves both read-only.
 fn pages_after(case: u8) -> HostPtr {
@@ -1753,6 +2289,15 @@ fn spinning<P: Platform>(
     queue: &P::CommandQueue,
     words: &P::Buffer,
 ) -> P::CommandBuffer {
+    let cb = command_buffer::<P>(queue);
+    spin::<P>(dev, &cb, words);
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_scheduled().unwrap();
+    cb
+}
+
+/// [`SPIN`]'s kernel over `words`, whose first word holds the rounds it runs, encoded in `cb`.
+fn spin<P: Platform>(dev: &P::Device, cb: &P::CommandBuffer, words: &P::Buffer) {
     let library = dev.new_library(SPIN).unwrap().unwrap().unwrap();
     let function = library
         .new_function(OnFault::Return, "spin")
@@ -1762,7 +2307,6 @@ fn spinning<P: Platform>(
         .new_compute_pipeline_state_for_function(Some(&function))
         .unwrap()
         .unwrap();
-    let cb = command_buffer::<P>(queue);
     let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
     for command in [
         ComputeCmd::SetComputePipelineState {
@@ -1781,9 +2325,6 @@ fn spinning<P: Platform>(
     ] {
         e.encode(OnFault::Return, command).unwrap();
     }
-    cb.commit(OnFault::Return).unwrap();
-    cb.wait_until_scheduled().unwrap();
-    cb
 }
 
 /// Guest pages of `count` pages whose first word holds [`ROUNDS`], for [`spinning`].

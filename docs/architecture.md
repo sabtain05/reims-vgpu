@@ -486,7 +486,8 @@ crate keeps its library.
 Under isolation, each guest task other than task 0 runs in a fresh service of its own, a
 `GpuTask`, on threads of its own in the host's process (`tasks::isolation::TaskThreads`, D10):
 the task's connection queue (the handshake and the host's messages, in order), its service
-queue (its jobs) and Metal's completion threads. There is no pooling, no reuse and no second task
+queue (its jobs) and Metal's completion threads. An exec's job runs on the FIFO thread that sent
+it instead, in the same order (5.4), unless `REIMS_VGPU_TASK_INLINE` is `0`. There is no pooling, no reuse and no second task
 in one service; a define after a death makes a new service. The service's objects come from the
 host's Metal device, and it reads guest RAM through the host's own mapping of it. The XR10 blit
 pipelines and the resource-index rebuild are the task's own, made or done once per task.
@@ -513,7 +514,9 @@ process.
 
 - `TaskLauncher::launch` makes a new service per call. `ServiceLink::send` is ordered and
   asynchronous; replies come back on the link's one serial queue, which also delivers the
-  service's messages, so a reply and a later message never reorder.
+  service's messages, so a reply and a later message never reorder. `ServiceLink::send_here`
+  is `send` delivered on the caller's thread, in the same order (5.4): the remote exec's, whose
+  FIFO thread waits for the reply anyway.
 - `tasks/wire.rs`: `ToService` (17 variants) and `ToHost` (4); a reply is a `Reply` of its
   values, callable more than once.
 - `tasks/remote/completions.rs` is the one piece of status-4 code every launcher shares: a crash
@@ -529,7 +532,17 @@ process.
 `tasks/isolation/link.rs`:
 - **The connection queue** delivers the host's messages to the service one at a time, in send
   order, each as the task's code (`TaskLife::run`). The handshake runs there, and so does the
-  task's end: the service's state is released, then the host is told.
+  task's end: the service's state is released, then the host is told. A message sent with
+  `send_here` (an exec) is delivered on the sender's thread, which takes the connection queue's
+  turn and then the service queue's (`SerialQueue::sync`), so it runs after every message and job
+  before it and holds both queues while the service runs its job there. A death there unwinds to
+  the delivery's `TaskLife::run` and ends only the task, as on the queues' workers. The reply,
+  made there, runs there too when the link's queue is idle with nothing queued: its turn on that
+  queue, taken under the state lock, is its place in the queue's order (`hold_if_idle`), and the
+  link queue's worker runs it otherwise, unless `REIMS_VGPU_TASK_INLINE_REPLY` is `0`. Of the
+  exec's four waits for a woken thread (the connection queue's worker, the service queue's, the
+  link queue's and the FIFO thread's), the delivery saves the first two when both queues are
+  idle, and the reply the last two when the link's queue is.
 - **The link's queue** makes every `HostSide` call and runs every reply, one at a time, in the
   order the service sent them. A message or reply the service hands over while the task runs is
   always delivered, before the end the host is told of.
@@ -730,7 +743,7 @@ shows it.
 | add and or signals | `rt::CoalescingSignal`: a display's new-frame signal, the EFI display's present source and timer, the stamp-wait report, the IOSurface device's doorbell | merges before the handler runs give one call; a release without a cancel drops pending data; the cancel callout frees the handler on the target |
 | the EFI timer | `rt::Timer`: a thread of its own on the platform's clock merging fires into a `CoalescingSignal` on the queue | starts at the wall time of its start, every 100 ms; missed fires coalesce; dropped uncancelled it keeps firing |
 | once | `rt::ProcessOnce` (`OnceLock`), held by its owner: an isolated task's XR10 blit pipelines, once per task | concurrent callers wait for the first; the block runs under `Hold::NONE`, whatever the caller's hold (6.2) |
-| the FIFO thread | a named thread (512 KiB) the platform starts (`rt::thread::spawn_named`) | its body, then what was held on it under a hold with no holder (its last-resort holder), then the FIFO (its target) dropped, on the thread |
+| the FIFO thread | a named thread (576 KiB: a queue worker's 512 KiB, which an isolated task's exec job it runs gets, and room for its own frames) the platform starts (`rt::thread::spawn_named`) | its body, then what was held on it under a hold with no holder (its last-resort holder), then the FIFO (its target) dropped, on the thread |
 | mutexes and condition variables | `parking_lot::{Mutex, Condvar, ReentrantMutex}` | each mutex guards its own fields and nothing more; every timed wait goes through `Clock::wait_until` |
 | reader-writer locks (a task's, the range tracker's) | `sync::WriterPrefRwLock` (`parking_lot::RwLock`) | writer preference: a thread's first read waits behind a queued writer, and `try_write` fails while a writer is queued; a read on a thread that already holds one goes through at once, so a nested read never hangs |
 | fields read both with and without a lock | `sync::StagedMutex` | unlocked readers see a guard's stores at its drop or explicit `publish()`, never store by store |
@@ -801,6 +814,11 @@ Rules beyond the chains:
   process's display thread, a release queue for each teardown moved off a queue it syncs onto
   (`held::release_off_thread`), and each isolated task's connection, service and link queues.
 - A thread per running EFI timer (`reims-vgpu.timer`), which only waits and merges.
+- On the Vulkan platform, the unmap thread (`reims-vgpu.unmap`), started at the first unmap
+  hold's release, which unmaps the library's mappings of guest pages a device's import held once
+  the import is freed, so a guest's delete that frees one does not unmap under its task's lock
+  (`reims-vgpu-vulkan`'s `remap`, "Unmaps an import waits for"; `REIMS_VGPU_UNMAP_THREAD=0` has
+  the release unmap them itself).
 - Metal's completion threads, and the host's own threads inside a call that may call back (both
   foreign).
 - The process's main thread, the host's, where every window's AppKit side runs: the application,

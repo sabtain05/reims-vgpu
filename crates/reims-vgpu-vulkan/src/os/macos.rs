@@ -187,6 +187,10 @@ pub(crate) fn dma_buf_refusal() -> Option<String> {
     None
 }
 
+/// Nothing, on macOS: the library's threads here give the scheduler no hint (`MetalThreads`
+/// starts plain pthreads), so a thread it starts inherits none of the library's to drop.
+pub(crate) fn drop_inherited_hints() {}
+
 /// The address whose bytes the runtime's memory at `at` shows: `at`, on macOS.
 pub(crate) fn shown_at(at: std::ptr::NonNull<u8>) -> std::ptr::NonNull<u8> {
     at
@@ -195,6 +199,27 @@ pub(crate) fn shown_at(at: std::ptr::NonNull<u8>) -> std::ptr::NonNull<u8> {
 /// A fresh range of `len` bytes that a view can be made of: on Mach, any allocation.
 pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     MetalVm::new().allocate_anywhere(len)
+}
+
+/// An alias's views taken away while nothing reads them: never on Mach, whose views take no
+/// limit of mappings ([`park`]).
+#[derive(Debug)]
+pub(crate) enum Parked {}
+
+/// Parks an alias's views: never on Mach ([`Parked`]), where they stay as they are.
+pub(crate) fn park(_at: HostAddr, _len: u64) -> Option<Parked> {
+    None
+}
+
+/// Maps a parked alias's views again: none is parked on Mach.
+pub(crate) fn unpark(parked: Parked) -> Result<(), KernReturn> {
+    match parked {}
+}
+
+/// `f`, whose views Linux's census of the views' mappings counts as aliases': run as it is on
+/// Mach, whose views take no such limit and no census.
+pub(crate) fn as_alias<R>(f: impl FnOnce() -> R) -> R {
+    f()
 }
 
 /// The host's page, which the tests lay their pages out by: Mach's 16 KiB on arm64, 4 KiB on
@@ -466,6 +491,7 @@ impl ClientPages {
                 offset,
                 gpu_read_only,
                 alias: Weak::new(),
+                named: None,
             },
         ));
     }

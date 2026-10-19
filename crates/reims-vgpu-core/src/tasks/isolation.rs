@@ -7,7 +7,8 @@
 //! reused, whose objects come from the host's Metal device and which reads guest RAM through the
 //! host's own mapping of it. The service's threads are the task's connection queue (the
 //! handshake and its messages, in order), the service's own queue (its jobs) and Metal's
-//! completion threads.
+//! completion threads; an exec's job runs on the FIFO thread that sent it, in its turn on both
+//! queues ([`link`], `ServiceLink::send_here`).
 //!
 //! What the host sees of a task:
 //! - **A death in the task's own code** ends the task and nothing else ([`life`]): its threads

@@ -1,7 +1,7 @@
 //! A FIFO's thread: its start, its stop and drain, and the loop that reads each command off the
 //! ring, waits for its barriers, publishes its bytes, pushes its stamp and runs it.
 //!
-//! The thread (512 KiB of stack) is named `reims-vgpu.fifo`; its target holds the FIFO until the
+//! The thread (576 KiB of stack, `rt::thread::FIFO_THREAD_STACK`) is named `reims-vgpu.fifo`; its target holds the FIFO until the
 //! thread's end, and the loop holds another reference. What is autoreleased on the thread outside
 //! a command's pool, or held under a hold with no holder (the deprecated opcodes', a signal's
 //! FIFO), goes to the thread's last-resort pool and holder, released at the loop's end, before

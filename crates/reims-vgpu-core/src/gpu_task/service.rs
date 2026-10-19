@@ -260,10 +260,23 @@ impl<P: Platform> GpuTask<P> {
     /// the catch's reply, and the holder releases it, most recent first, as the job ends, before
     /// the pool pops. A death in the job releases none of it and leaves the pool pushed.
     pub(super) fn job(&self, f: impl for<'u> FnOnce(&Arc<GpuTask<P>>, Hold<'u>) + Send + 'static) {
+        self.job_on(false, f)
+    }
+
+    /// [`GpuTask::job`], on the service queue's worker, or, when `here`, on the calling thread
+    /// as the queue's `sync` runs a block: once every job queued before it has run, holding the
+    /// queue until it returns. A job run here is inside the delivery's run of the task's code
+    /// ([`ServiceSide::on_message_here`]), so a death in it unwinds to that run, through the
+    /// queue, which it gives up.
+    pub(super) fn job_on(
+        &self,
+        here: bool,
+        f: impl for<'u> FnOnce(&Arc<GpuTask<P>>, Hold<'u>) + Send + 'static,
+    ) {
         let Some(this) = self.me.upgrade() else {
             return;
         };
-        self.queue.exec_async(move || {
+        let run = move || {
             let life = Arc::clone(&this.life);
             let _ = life.run(|| {
                 let platform = Arc::clone(&this.platform);
@@ -273,7 +286,12 @@ impl<P: Platform> GpuTask<P> {
                 drop(held);
                 drop(pool);
             });
-        });
+        };
+        if here {
+            self.queue.sync(run);
+        } else {
+            self.queue.exec_async(run);
+        }
     }
 
     /// `f` as a Metal completion handler of the task's: it runs as the task's code, and not at
@@ -614,6 +632,7 @@ impl<P: Platform> ServiceSide<P> for GpuTask<P> {
                 gpu_completion,
                 reply,
             } => self.exec(
+                false,
                 data,
                 cmd_buffer_count,
                 resource_count,
@@ -642,6 +661,32 @@ impl<P: Platform> ServiceSide<P> for GpuTask<P> {
             }
             ToService::SetFifoEvent { event, index } => self.set_fifo_event(event, index),
             ToService::FifoDeleted { stamp_index, reply } => self.fifo_deleted(stamp_index, reply),
+        }
+    }
+
+    /// An exec runs its job on the sender's thread, in its turn on the service queue
+    /// ([`GpuTask::job_on`]); every other message as [`ServiceSide::on_message`].
+    fn on_message_here(&self, m: ToService<P>) {
+        match m {
+            ToService::ExecIndirect3 {
+                data,
+                cmd_buffer_count,
+                resource_count,
+                stamp_index,
+                fifo_event_value_in,
+                gpu_completion,
+                reply,
+            } => self.exec(
+                true,
+                data,
+                cmd_buffer_count,
+                resource_count,
+                stamp_index,
+                fifo_event_value_in,
+                gpu_completion,
+                reply,
+            ),
+            m => self.on_message(m),
         }
     }
 

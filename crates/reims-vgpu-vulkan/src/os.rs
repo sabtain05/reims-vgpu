@@ -29,8 +29,9 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 pub(crate) use host_os::{
-    Drawables, METAL_LEVEL, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, dma_buf_refusal,
-    host_memory, import_view, plane_shape, shown_at, surface_memory_hold,
+    Drawables, METAL_LEVEL, Parked, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, as_alias,
+    dma_buf_refusal, drop_inherited_hints, host_memory, import_view, park, plane_shape, shown_at,
+    surface_memory_hold, unpark,
 };
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_gpu_core_count,
@@ -44,7 +45,7 @@ pub use wsi::{add_window_extensions, present_fences};
 
 pub(crate) use surface::{
     MadeOver, READ_ONLY_DIRECTION, base_in_pages, dropped_write, gpu_read_only, in_runs,
-    memory_kind, over_guest_pages, page_runs, plane, plane_facts, surface_alias,
+    memory_kind, named_bytes, over_guest_pages, page_runs, plane, plane_facts, surface_alias,
     surface_bytes_memory, surface_memory, surface_offset, write_surface_bytes, ycbcr_facts,
 };
 

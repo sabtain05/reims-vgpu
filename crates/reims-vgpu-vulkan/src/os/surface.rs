@@ -70,12 +70,21 @@ pub(crate) fn ycbcr_facts(surface: &OsSurface, plane: u64) -> Option<rt::IoSurfa
 /// allocation is another mapping of the pages, the base address that offset into it, and a
 /// write through it shows in the pages at that offset (measured on the M3 Max, offsets 0x40,
 /// 0x1000 and 0x4000).
+#[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
 pub(crate) fn surface_memory(surface: &OsSurface) -> Vec<std::ops::Range<u64>> {
     let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
-    let made = made_over(surface);
-    let first = base.saturating_sub(made.offset);
-    let own = std::iter::once(first..first.saturating_add(surface.alloc_size()));
-    own.chain(made.pages).collect()
+    // The pages copied once, under the record's lock; no record is no pages and offset 0. The
+    // surface's own range comes first, its size read after the lock.
+    let (offset, mut memory) = recorded(surface, |made| {
+        let mut memory = Vec::with_capacity(1 + made.pages.len());
+        memory.push(0..0);
+        memory.extend_from_slice(&made.pages);
+        (made.offset, memory)
+    })
+    .unwrap_or_else(|| (0, vec![0..0]));
+    let first = base.saturating_sub(offset);
+    memory[0] = first..first.saturating_add(surface.alloc_size());
+    memory
 }
 
 /// The host memory of `surface`'s bytes at `offsets`, each a first byte and an end counted from
@@ -86,18 +95,26 @@ pub(crate) fn surface_bytes_memory(
     offsets: &[std::ops::Range<u64>],
 ) -> Vec<std::ops::Range<u64>> {
     let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
-    let own = offsets
-        .iter()
-        .map(|o| base.saturating_add(o.start)..base.saturating_add(o.end));
-    let made = made_over(surface);
-    let at = |o: &std::ops::Range<u64>| {
-        made.offset.saturating_add(o.start)..made.offset.saturating_add(o.end)
+    let own = || {
+        offsets
+            .iter()
+            .map(|o| base.saturating_add(o.start)..base.saturating_add(o.end))
     };
-    let paged: Vec<_> = offsets
-        .iter()
-        .flat_map(|o| in_runs(&made.pages, &at(o)))
-        .collect();
-    own.chain(paged).collect()
+    // Read under the record's lock, without copying its pages: a surface over the guest's pages
+    // may have a run for each (2,025 for an x86-64 guest's 1080p surface), and a texture on it
+    // reads this at each encode that binds or uses it. No record is no pages and offset 0.
+    recorded(surface, |made| {
+        let at = |o: &std::ops::Range<u64>| {
+            made.offset.saturating_add(o.start)..made.offset.saturating_add(o.end)
+        };
+        let mut memory = Vec::with_capacity(offsets.len() + made.pages.len());
+        memory.extend(own());
+        for o in offsets {
+            each_in_runs(&made.pages, &at(o), |held| memory.push(held));
+        }
+        memory
+    })
+    .unwrap_or_else(|| own().collect())
 }
 
 /// The host ranges that hold the bytes `offsets` of memory laid out over `runs` in their order
@@ -107,19 +124,28 @@ pub(crate) fn in_runs(
     offsets: &std::ops::Range<u64>,
 ) -> Vec<std::ops::Range<u64>> {
     let mut held = Vec::new();
+    each_in_runs(runs, offsets, |range| held.push(range));
+    held
+}
+
+/// [`in_runs`], each range given to `each` in its order.
+fn each_in_runs(
+    runs: &[std::ops::Range<u64>],
+    offsets: &std::ops::Range<u64>,
+    mut each: impl FnMut(std::ops::Range<u64>),
+) {
     let mut at = 0u64;
     for run in runs {
         let length = run.end - run.start;
         let (first, end) = (offsets.start.max(at), offsets.end.min(at + length));
         if first < end {
-            held.push(run.start + (first - at)..run.start + (end - at));
+            each(run.start + (first - at)..run.start + (end - at));
         }
         at += length;
         if at >= offsets.end {
             break;
         }
     }
-    held
 }
 
 /// The offset of `surface`'s bytes into its allocation (`kIOSurfaceOffset`), as
@@ -127,18 +153,12 @@ pub(crate) fn in_runs(
 /// page-aligned mapping of `IOSurfaceGetAllocSize` bytes (measured on the M3 Max at 0x40, 0x1000
 /// and 0x4000, over the guest's pages); 0 for a surface made otherwise.
 pub(crate) fn surface_offset(surface: &OsSurface) -> u64 {
-    made_over(surface).offset
+    recorded(surface, |made| made.offset).unwrap_or_default()
 }
 
 /// Whether `surface` was made over the guest's pages (`OsSurfaces::create`).
 pub(crate) fn over_guest_pages(surface: &OsSurface) -> bool {
     recorded(surface, |made| !made.pages.is_empty()).unwrap_or(false)
-}
-
-/// What `surface` was made over, as its OS records it: no pages and offset 0 for a surface
-/// made over neither the guest's pages nor an offset into its allocation.
-fn made_over(surface: &OsSurface) -> MadeOver {
-    recorded(surface, |made| made.clone()).unwrap_or_default()
 }
 
 /// The `kIOSurfaceClientDirection` of a surface core makes over the guest's pages read-only for
@@ -293,14 +313,62 @@ fn recorded<T>(surface: &OsSurface, read: impl FnOnce(&MadeOver) -> T) -> Option
 
 /// What a surface was made over: the guest's pages, in its bytes' order, merged into runs, and
 /// its bytes' offset into its allocation (`kIOSurfaceOffset`); whether the GPU's writes through
-/// it never reach them ([`gpu_read_only`]), and the alias of its allocation its buffers lie
-/// over while one lives, where they lie over one ([`surface_alias`]).
+/// it never reach them ([`gpu_read_only`]), the alias of its allocation its buffers lie over
+/// while one lives, where they lie over one ([`surface_alias`]), and the bytes a texture over it
+/// last named as the guest's pages ([`named_bytes`]). Its pages and offset are those it was made
+/// with, which never change.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MadeOver {
     pub(crate) pages: Vec<std::ops::Range<u64>>,
     pub(crate) offset: u64,
     pub(crate) gpu_read_only: bool,
     pub(crate) alias: Weak<Alias>,
+    pub(crate) named: Option<NamedBytes>,
+}
+
+/// A surface's bytes `bytes`, from its base address, as [`named_bytes`] named them: their host
+/// memory ([`surface_bytes_memory`]) named as the guest's pages are ([`crate::remap::as_guests`]),
+/// at the epoch `epoch` of core's mappings of them.
+#[derive(Debug, Clone)]
+pub(crate) struct NamedBytes {
+    bytes: std::ops::Range<u64>,
+    epoch: u64,
+    memory: Arc<[std::ops::Range<u64>]>,
+}
+
+/// The host memory of `surface`'s bytes `bytes` (a first byte and an end, from its base address,
+/// [`surface_bytes_memory`]) named as the guest's pages are ([`crate::remap::as_guests`]), as a
+/// texture made over the surface is checked against the textures heaps keep apart
+/// ([`crate::gpu::over_pages`]). A display's swap makes a texture over the surface it presents
+/// each frame, over the same bytes, and an x86-64 guest's 1080p surface has 2,026 ranges, so the
+/// surface's record keeps what was named last: the same bytes at the same epoch of core's
+/// mappings ([`crate::remap::epoch`]) name the same memory, as the surface's pages and offset
+/// never change, and are given as they were named then; other bytes, a later epoch or a surface
+/// the OS did not record are named again. The epoch is read before the record, so what is given
+/// is what naming would answer at that read.
+pub(crate) fn named_bytes(
+    surface: &OsSurface,
+    bytes: std::ops::Range<u64>,
+) -> Arc<[std::ops::Range<u64>]> {
+    let now = crate::remap::epoch();
+    let kept = recorded(surface, |made| {
+        (made.named.as_ref())
+            .filter(|named| named.bytes == bytes && named.epoch == now)
+            .map(|named| Arc::clone(&named.memory))
+    });
+    if let Some(memory) = kept.flatten() {
+        return memory;
+    }
+    let memory = surface_bytes_memory(surface, std::slice::from_ref(&bytes));
+    let (memory, epoch) = crate::remap::as_guests_at(memory);
+    let memory: Arc<[std::ops::Range<u64>]> = memory.into();
+    let named = NamedBytes {
+        bytes,
+        epoch,
+        memory: Arc::clone(&memory),
+    };
+    host_os::recorded_mut(surface, |made| made.named = Some(named));
+    memory
 }
 
 /// The runs of `pages`, each a host first byte and a length, those that follow on in the host's
@@ -400,6 +468,115 @@ pub(crate) mod tests {
     /// The pages of [`bgra_surface_over_at`], freed.
     pub(crate) fn free(pages: HostPtr, length: u64) {
         assert!(OsVm::new().deallocate(pages, length).is_success());
+    }
+
+    /// A surface's bytes named as the guest's pages are, as its record keeps them
+    /// ([`named_bytes`]): the same bytes at the same epoch of core's mappings give what was named,
+    /// other bytes, or the same once core's mappings of a page under them changed, are named
+    /// again, and each answer is what naming them then answers
+    #[test]
+    fn named_bytes_are_kept_until_the_mappings_change() {
+        use reims_vgpu_core::platform::os::surface::Surface as _;
+        let (s, pages, length) = bgra_surface_over_runs(4);
+        let fresh = |bytes: &std::ops::Range<u64>| {
+            crate::remap::as_guests(surface_bytes_memory(&s, std::slice::from_ref(bytes)))
+        };
+        let all = 0..s.alloc_size();
+        let first = named_bytes(&s, all.clone());
+        assert_eq!(&*first, &fresh(&all)[..]);
+        assert!(Arc::ptr_eq(&first, &named_bytes(&s, all.clone())), "kept");
+        let half = 0..s.alloc_size() / 2;
+        let other = named_bytes(&s, half.clone());
+        assert_eq!(&*other, &fresh(&half)[..]);
+        assert!(!Arc::ptr_eq(&other, &first), "other bytes, named again");
+        assert!(Arc::ptr_eq(&other, &named_bytes(&s, half.clone())));
+        // The surface's second run of pages, which `half` holds, shown by a mapping of core's.
+        let page = OsVm::new().page_size();
+        let second = pages.addr().to_u64() + 2 * page;
+        let shown = 0x55_0000_0000;
+        crate::remap::guest_mapping_for_tests(second, second + page, Some(shown));
+        let renamed = named_bytes(&s, half.clone());
+        assert!(
+            !Arc::ptr_eq(&renamed, &other),
+            "named again once the mappings changed"
+        );
+        assert_eq!(&*renamed, &fresh(&half)[..]);
+        assert!(renamed.contains(&(shown..shown + page)), "{renamed:x?}");
+        crate::remap::guest_mapping_for_tests(second, second + page, None);
+        let back = named_bytes(&s, half.clone());
+        assert_eq!(&*back, &*other);
+        assert_eq!(&*back, &fresh(&half)[..]);
+        drop(s);
+        free(pages, length);
+    }
+
+    /// A 'BGRA' surface of `runs` rows, each a page of the host's long, made over every other
+    /// page of a fresh range (`kIOSurfaceClientAddressRanges`), so that it was made over `runs`
+    /// runs of pages, as an x86 guest's 1920 × 1080 surface is over 2,025 pages on a host of
+    /// 4 KiB pages; and that range, which the caller frees once the surface is gone.
+    pub(crate) fn bgra_surface_over_runs(runs: u64) -> (OsSurface, HostPtr, u64) {
+        let page = OsVm::new().page_size();
+        let length = 2 * runs * page;
+        let pages = allocate_aliasable(length).unwrap();
+        let first = pages.addr().to_u64();
+        let spec = SurfaceSpec {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            alloc_size: runs * page,
+            width: page / 4,
+            height: runs,
+            bytes_per_element: 4,
+            bytes_per_row: page,
+            element_width: 1,
+            element_height: 1,
+            client_address_ranges: Some(
+                (0..runs)
+                    .map(|i| PhysicalMemoryRange {
+                        physical_address: first + 2 * i * page,
+                        physical_length: page,
+                    })
+                    .collect(),
+            ),
+            ..SurfaceSpec::default()
+        };
+        (OsSurfaces::new().create(&spec).unwrap(), pages, length)
+    }
+
+    /// The mean time of a call of `f` over each of five rounds of `calls`, in microseconds,
+    /// after one to warm up.
+    pub(crate) fn microseconds_a_call(calls: u32, mut f: impl FnMut()) -> Vec<f64> {
+        use reims_vgpu_core::platform::os::Clock as _;
+        let clock = crate::os::OsClock::new();
+        (0..6)
+            .map(|_| {
+                let start = clock.now_mono();
+                for _ in 0..calls {
+                    f();
+                }
+                let took = clock.now_mono().saturating_duration_since(start);
+                took.as_secs_f64() * 1e6 / f64::from(calls)
+            })
+            .skip(1)
+            .collect()
+    }
+
+    /// Prints how long `surface_bytes_memory` takes for all of a surface made over 2,025 runs
+    /// of pages ([`bgra_surface_over_runs`]), as a texture on an x86 guest's 1920 × 1080 surface
+    /// has it made
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the time a call"]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
+    fn surface_bytes_memory_over_2025_runs() {
+        use reims_vgpu_core::platform::os::surface::Surface as _;
+
+        let (s, pages, length) = bgra_surface_over_runs(2025);
+        let bytes = [0..s.alloc_size()];
+        assert_eq!(surface_bytes_memory(&s, &bytes).len(), 1 + 2025);
+        let rounds = microseconds_a_call(200, || {
+            std::hint::black_box(surface_bytes_memory(&s, std::hint::black_box(&bytes)));
+        });
+        println!("surface_bytes_memory over 2,025 runs, µs a call: {rounds:.1?}");
+        drop(s);
+        free(pages, length);
     }
 
     /// A lookup of a surface, as an isolated task's surface is (`lookup_by_port`), a reference

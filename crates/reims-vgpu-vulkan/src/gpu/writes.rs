@@ -195,17 +195,10 @@ pub fn texture_memory(t: &TextureObject) -> Memory {
     match (&t.surface, &t.under) {
         (Some(s), _) => match &t.plane {
             Some(p) => {
-                // A rotated texture's rows may run along either side.
-                let (width, height) = plain(|| (t.raw.width(), t.raw.height()));
-                let rows = if plain(|| t.raw.rotation()) == 0 {
-                    height
-                } else {
-                    width.max(height)
-                };
                 let pf = plain(|| t.raw.pixel_format());
                 Memory {
                     refused: crate::gpu::ycbcr::writes_refused(pf).then_some(pf),
-                    ..Memory::of_surface_bytes(s, plane_bytes(p.offset, p.bytes_per_row, rows))
+                    ..Memory::of_surface_bytes(s, plane_bytes(p.offset, p.bytes_per_row, rows(t)))
                 }
             }
             None => Memory::of_surface(s),
@@ -213,6 +206,29 @@ pub fn texture_memory(t: &TextureObject) -> Memory {
         (None, Some(Under::Buffer(b, bytes))) => buffer_bytes_memory(b, bytes.clone()),
         (None, Some(Under::Heap(h, bytes))) => heap_bytes_memory(h, bytes.clone()),
         _ => Memory::default(),
+    }
+}
+
+/// The host memory `t`'s texels lie in ([`texture_memory`]'s ranges), named as the guest's pages
+/// are ([`crate::remap::as_guests`]): for a texture over a plane of a surface, as the surface's
+/// record keeps them for its bytes ([`crate::os::named_bytes`]).
+pub fn texture_named_memory(t: &TextureObject) -> Arc<[Range<u64>]> {
+    match (&t.surface, &t.plane) {
+        (Some(s), Some(p)) => {
+            crate::os::named_bytes(s, plane_bytes(p.offset, p.bytes_per_row, rows(t)))
+        }
+        _ => crate::remap::as_guests(texture_memory(t).ranges).into(),
+    }
+}
+
+/// The rows of `t`, a texture over a plane of a surface, as its plane's bytes count them: its
+/// height, or its longer side for a rotated one, whose rows may run along either side.
+fn rows(t: &TextureObject) -> u64 {
+    let (width, height) = plain(|| (t.raw.width(), t.raw.height()));
+    if plain(|| t.raw.rotation()) == 0 {
+        height
+    } else {
+        width.max(height)
     }
 }
 
@@ -255,7 +271,7 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
     }
     let kept = b.backing.kept();
     let paged = b.backing.in_pages(&bytes);
-    if paged.is_some() || b.backing.kept_contents().is_some() {
+    if paged.is_some() || b.backing.keeps_contents() {
         return Memory::over(paged.unwrap_or_default(), kept);
     }
     let contents = plain(|| b.raw.contents()).map(|first| {

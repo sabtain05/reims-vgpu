@@ -1,5 +1,6 @@
-//! The host pages runtime imports hold, and the unmaps that wait for them ([`super::UnmapHold`]):
-//! the bookkeeping alone, which makes no call (`super`'s docs, "Unmaps an import waits for").
+//! The host pages runtime imports hold, the unmaps that wait for them ([`super::UnmapHold`]), and
+//! those left to the unmap thread: the bookkeeping alone, which makes no call (`super`'s docs,
+//! "Unmaps an import waits for").
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -16,7 +17,12 @@ pub(super) struct Holds {
     /// starts.
     longest: u64,
     /// The unmaps that wait, no two sharing a page: each made whole once no hold meets it.
-    waiting: Vec<Range<u64>>,
+    pub(super) waiting: Vec<Range<u64>>,
+    /// The unmaps no hold meets any more that a hold's release left to the unmap thread, until
+    /// it takes them; none shares a page with another, or with one that waits.
+    queued: Vec<Range<u64>>,
+    /// Whether the unmap thread is making the unmaps it took last.
+    making: bool,
 }
 
 impl Holds {
@@ -27,6 +33,8 @@ impl Holds {
             held: BTreeMap::new(),
             longest: 0,
             waiting: Vec::new(),
+            queued: Vec::new(),
+            making: false,
         }
     }
 
@@ -47,25 +55,13 @@ impl Holds {
     }
 
     /// `pages` show other pages from now on (an overwrite, or an unmap made now): what waited
-    /// to be unmapped there no longer does.
+    /// to be unmapped there, or was left to the unmap thread, no longer is.
     pub(super) fn replaced(&mut self, pages: &Range<u64>) {
-        if self.waiting.is_empty() || pages.is_empty() {
+        if pages.is_empty() {
             return;
         }
-        let mut kept = Vec::with_capacity(self.waiting.len());
-        for waiting in self.waiting.drain(..) {
-            if waiting.end <= pages.start || pages.end <= waiting.start {
-                kept.push(waiting);
-                continue;
-            }
-            if waiting.start < pages.start {
-                kept.push(waiting.start..pages.start);
-            }
-            if pages.end < waiting.end {
-                kept.push(pages.end..waiting.end);
-            }
-        }
-        self.waiting = kept;
+        cut(&mut self.waiting, pages);
+        cut(&mut self.queued, pages);
     }
 
     /// An unmap of `pages`: `true` where a live hold meets them, and the unmap waits, whole, for
@@ -98,6 +94,56 @@ impl Holds {
         self.waiting = kept;
         free
     }
+
+    /// Leaves `free`, unmaps [`Holds::release`] answered, to the unmap thread.
+    pub(super) fn queue(&mut self, free: Vec<Range<u64>>) {
+        self.queued.extend(free);
+    }
+
+    /// Whether an unmap waits for the unmap thread to take it.
+    pub(super) fn queued(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    /// The unmap thread takes every unmap left to it, which it makes under no lock until
+    /// [`Holds::made`].
+    pub(super) fn take_queued(&mut self) -> Vec<Range<u64>> {
+        let taken = std::mem::take(&mut self.queued);
+        self.making |= !taken.is_empty();
+        taken
+    }
+
+    /// The unmap thread made what it took last.
+    pub(super) fn made(&mut self) {
+        self.making = false;
+    }
+
+    /// Whether the unmap thread has an unmap left to make, taken or not.
+    #[cfg(test)]
+    pub(super) fn unmapping(&self) -> bool {
+        self.making || !self.queued.is_empty()
+    }
+}
+
+/// `ranges` less what of them lies in `pages`.
+fn cut(ranges: &mut Vec<Range<u64>>, pages: &Range<u64>) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut kept = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if range.end <= pages.start || pages.end <= range.start {
+            kept.push(range);
+            continue;
+        }
+        if range.start < pages.start {
+            kept.push(range.start..pages.start);
+        }
+        if pages.end < range.end {
+            kept.push(pages.end..range.end);
+        }
+    }
+    *ranges = kept;
 }
 
 #[cfg(test)]
@@ -157,6 +203,28 @@ mod tests {
         assert!(h.unmap(pages(999, 1)));
         assert!(!h.unmap(pages(1000, 1)), "past its end");
         assert_eq!(h.release(0, long), vec![pages(999, 1)]);
+    }
+
+    /// Unmaps left to the unmap thread wait until it takes them, all at once; pages mapped anew,
+    /// or unmapped now, under one it has not taken leave it, as they leave a waiting unmap
+    #[test]
+    fn the_unmap_thread_takes_what_was_left_to_it() {
+        let mut h = Holds::new();
+        let a = h.hold(pages(0, 8));
+        assert!(h.unmap(pages(0, 8)));
+        let free = h.release(0, a);
+        assert_eq!(free, vec![pages(0, 8)]);
+        h.queue(free);
+        assert!(h.queued() && h.unmapping());
+        h.replaced(&pages(2, 2));
+        assert!(
+            !h.unmap(pages(6, 1)),
+            "no hold meets it: made now, and out of the queue"
+        );
+        assert_eq!(h.take_queued(), vec![pages(0, 2), pages(4, 2), pages(7, 1)]);
+        assert!(!h.queued() && h.unmapping(), "taken, not yet made");
+        h.made();
+        assert!(!h.unmapping());
     }
 
     /// Pages mapped anew, or unmapped now, under a waiting unmap leave it: what of it they cover

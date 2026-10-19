@@ -1404,7 +1404,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // A texture on a surface over the guest's pages meets a texture a heap over them keeps
         // apart through them.
         if over_guest_pages {
-            let memory = crate::gpu::writes::texture_memory(&texture).ranges;
+            let memory = crate::gpu::writes::texture_named_memory(&texture);
             crate::gpu::over_pages::over_surface(sel, memory, texture.life());
         }
         Ok(Some(texture))
@@ -1874,12 +1874,12 @@ pub(crate) mod tests {
     /// runs: its deallocator runs as the command buffer completes, Metal's moment, and core's
     /// unmap of the mapping inside it, through the platform's VM, answers success and leaves the
     /// pages mapped, as the device still imports them; the runtime frees the import after the
-    /// deallocator and then drops the keep-alive, whose hold unmaps them. Nothing waits on another
-    /// thread: the command buffer completes, the deallocator returns, and the unmap lands. The
-    /// command buffer reads the buffer's bytes, and no deallocator is delayed. The release lands
-    /// while the kernel runs, its end mark unset, or the test fails: a kernel waiting for a word
-    /// the CPU writes after the release cannot hold the command buffer instead, as Metal's GPU saw
-    /// no CPU write to a word it polled (`tests/new_images.rs`)
+    /// deallocator and then drops the keep-alive, whose hold has the unmap thread unmap them.
+    /// Nothing waits on another thread: the command buffer completes, the deallocator returns,
+    /// and the unmap lands. The command buffer reads the buffer's bytes, and no deallocator is
+    /// delayed. The release lands while the kernel runs, its end mark unset, or the test fails: a
+    /// kernel waiting for a word the CPU writes after the release cannot hold the command buffer
+    /// instead, as Metal's GPU saw no CPU write to a word it polled (`tests/new_images.rs`)
     #[test]
     fn an_unmap_in_a_deallocator_waits_for_the_import() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -2021,6 +2021,8 @@ pub(crate) mod tests {
             within(&|| !crate::remap::unmap_waits(va, LEN)),
             "the keep-alive was not dropped"
         );
+        // The hold's drop left the unmap to the unmap thread.
+        crate::remap::unmaps_made();
         // SAFETY: a read of the first page where it is mapped; another test's thread may have
         // mapped it again since, without these bytes.
         let gone = !crate::os::mapped(va) || unsafe { va.as_ptr::<u8>().read_volatile() } != BYTE;
